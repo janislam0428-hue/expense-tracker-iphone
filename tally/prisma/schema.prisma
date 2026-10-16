@@ -1,0 +1,239 @@
+// Tally data model.
+// Values such as type, status and channel are stored as text and validated in
+// code (see src/lib/domain.ts) so the schema moves to Postgres without changes.
+// Money is stored in minor units (cents) as integers to avoid rounding errors.
+// All timestamps are stored in UTC and displayed in Settings.timezone.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Transaction {
+  id                 String   @id @default(cuid())
+  occurredAt         DateTime
+  /// exact | minute | inferred_weekday | date_only
+  datePrecision      String   @default("minute")
+  /// Always positive. Direction comes from `type`.
+  amountMinor        Int
+  currency           String   @default("HKD")
+  merchant           String
+  /// Lowercased, width-folded, punctuation-free merchant used for matching
+  merchantNormalized String
+  /// Person on the other side of a PayMe person to person payment
+  counterparty       String?
+  /// Extra detail from the source, e.g. "Bus" or a PayMe note
+  description        String?
+  /// Location from Wallet, e.g. "Cheung Sha Wan, Kowloon"
+  location           String?
+
+  categoryId    String?
+  category      Category? @relation("TransactionCategory", fields: [categoryId], references: [id], onDelete: SetNull)
+  subcategoryId String?
+  subcategory   Category? @relation("TransactionSubcategory", fields: [subcategoryId], references: [id], onDelete: SetNull)
+
+  sourceId String
+  source   PaymentSource @relation(fields: [sourceId], references: [id])
+
+  /// screenshot | shortcut | email | wallet | sms | csv | paste | manual | demo
+  channel String
+  /// expense | income | transfer | refund | top_up
+  type    String @default("expense")
+
+  purposeId     String?
+  purpose       Purpose? @relation(fields: [purposeId], references: [id], onDelete: SetNull)
+  /// auto | needs_review | confirmed
+  purposeStatus String   @default("auto")
+  /// JSON array of reason codes, e.g. ["over_threshold","p2p"]
+  reviewReasons String   @default("[]")
+
+  /// Octopus balance after this transaction, used for chain checks
+  balanceAfterMinor Int?
+  /// Source reference such as a PayMe Transaction ID
+  externalRef       String?
+  notes             String?
+  /// Original text this row was parsed from, kept for review
+  rawText           String?
+  /// Deterministic key used for exact duplicate detection
+  fingerprint       String
+  parseConfidence   Float?
+  /// Set when this row was linked to an earlier copy of the same payment
+  duplicateOfId     String?
+
+  importBatchId String?
+  importBatch   ImportBatch? @relation(fields: [importBatchId], references: [id], onDelete: SetNull)
+
+  isDemo    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([occurredAt])
+  @@index([fingerprint])
+  @@index([sourceId, occurredAt])
+  @@index([purposeStatus])
+  @@index([categoryId, occurredAt])
+  @@index([isDemo])
+  @@index([externalRef])
+}
+
+model Category {
+  id        String     @id @default(cuid())
+  name      String
+  parentId  String?
+  parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children  Category[] @relation("CategoryTree")
+  /// Notion tag colour: gray | brown | orange | yellow | green | blue | purple | pink | red
+  color     String     @default("gray")
+  icon      String?
+  /// Ambiguous categories always ask for a purpose (dining, shopping, beauty...)
+  ambiguous Boolean    @default(false)
+  /// Per category monthly alert in minor units. Null means use the global default.
+  monthlyAlertMinor Int?
+  sortOrder Int        @default(0)
+  archived  Boolean    @default(false)
+
+  transactions    Transaction[]  @relation("TransactionCategory")
+  subTransactions Transaction[]  @relation("TransactionSubcategory")
+  rules           MerchantRule[]
+  budgets         Budget[]
+  alertRules      AlertRule[]
+
+  @@unique([name, parentId])
+}
+
+model Purpose {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  sortOrder   Int     @default(0)
+  /// Single key used in the To confirm inbox, e.g. "1"
+  shortcutKey String?
+  color       String  @default("gray")
+  isSystem    Boolean @default(false)
+
+  transactions Transaction[]
+  rules        MerchantRule[]
+}
+
+model PaymentSource {
+  id       String  @id @default(cuid())
+  /// octopus | payme | credit_card | bank | cash
+  kind     String
+  name     String  @unique
+  last4    String?
+  color    String  @default("gray")
+  isActive Boolean @default(true)
+
+  transactions Transaction[]
+}
+
+model MerchantRule {
+  id         String    @id @default(cuid())
+  pattern    String
+  /// exact | contains | regex
+  matchType  String    @default("contains")
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  purposeId  String?
+  purpose    Purpose?  @relation(fields: [purposeId], references: [id], onDelete: SetNull)
+  /// Optional: only apply to one source kind
+  sourceKind String?
+  hits       Int       @default(0)
+  isDemo     Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  @@index([pattern])
+}
+
+model ImportBatch {
+  id                String    @id @default(cuid())
+  /// Same values as Transaction.channel
+  channel           String
+  sourceHint        String?
+  capturedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  added             Int       @default(0)
+  skippedDuplicates Int       @default(0)
+  needsReview       Int       @default(0)
+  /// JSON array of warning strings
+  warnings          String    @default("[]")
+  rawPayloadHash    String?
+  /// preview | committed
+  status            String    @default("committed")
+  isDemo            Boolean   @default(false)
+
+  transactions Transaction[]
+  captures     RawCapture[]
+
+  @@index([rawPayloadHash])
+}
+
+model RawCapture {
+  id            String      @id @default(cuid())
+  importBatchId String
+  importBatch   ImportBatch @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  /// image | text | email | json
+  kind          String
+  text          String
+  ocrConfidence Float?
+  capturedAt    DateTime?
+  createdAt     DateTime    @default(now())
+}
+
+model AlertRule {
+  id         String    @id @default(cuid())
+  /// global | category
+  scope      String    @default("global")
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  /// fixed | adaptive  (adaptive is planned, see src/lib/alerts)
+  strategy   String    @default("fixed")
+  /// JSON, e.g. {"thresholdMinor":200000} or {"multiplier":1.5,"windowMonths":3}
+  params     String    @default("{}")
+  enabled    Boolean   @default(true)
+}
+
+model Budget {
+  id          String   @id @default(cuid())
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  /// month | quarter | year
+  period      String   @default("month")
+  amountMinor Int
+
+  @@unique([categoryId, period])
+}
+
+model SavedView {
+  id        String   @id @default(cuid())
+  name      String
+  /// JSON filter state
+  filters   String   @default("{}")
+  groupBy   String?
+  sort      String?
+  createdAt DateTime @default(now())
+}
+
+/// Single row table (id = 1)
+model Settings {
+  id                   Int       @id @default(1)
+  currency             String    @default("HKD")
+  timezone             String    @default("Asia/Hong_Kong")
+  /// 1 = Monday
+  weekStart            Int       @default(1)
+  /// Amounts strictly above this go to To confirm. 500.00 HKD by default.
+  reviewThresholdMinor Int       @default(50000)
+  /// Monthly per category alert. 2,000.00 HKD by default.
+  alertThresholdMinor  Int       @default(200000)
+  demoEnabled          Boolean   @default(true)
+  /// Hash of the webhook bearer token (Phase 3)
+  apiTokenHash         String?
+  /// scrypt hash. When null, the APP_PASSWORD environment variable is used.
+  passwordHash         String?
+  lastImportAt         DateTime?
+  updatedAt            DateTime  @updatedAt
+}
