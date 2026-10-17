@@ -69,6 +69,23 @@ export async function saveSettings(_prev: FormState, formData: FormData): Promis
   return { ok: "Settings saved" };
 }
 
+export async function updateCategoryThresholdQuick(
+  categoryId: string,
+  amountMinor: number,
+): Promise<{ ok?: string; error?: string }> {
+  await requireAuth();
+  try {
+    const cat = await db.category.update({
+      where: { id: categoryId },
+      data: { monthlyAlertMinor: amountMinor },
+    });
+    revalidatePath("/", "layout");
+    return { ok: `Updated ${cat.name} monthly threshold to $${Math.round(amountMinor / 100)}` };
+  } catch {
+    return { error: "Could not update category threshold" };
+  }
+}
+
 export async function setDemoData(enabled: boolean): Promise<FormState> {
   await requireAuth();
   if (enabled) {
@@ -96,7 +113,6 @@ export async function changePassword(_prev: FormState, formData: FormData): Prom
   if (!parsed.success) return { error: parsed.error.issues[0]?.message };
   if ((await checkPassword(parsed.data.current)) !== "ok") return { error: "Your current password is not right" };
   await db.settings.update({ where: { id: 1 }, data: { passwordHash: await hashPassword(parsed.data.next) } });
-  // Re-issue this device's session for the new password. Other devices are signed out.
   await createSession();
   return { ok: "Password changed. Other devices have been signed out." };
 }
