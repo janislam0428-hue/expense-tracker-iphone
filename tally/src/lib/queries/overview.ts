@@ -6,7 +6,12 @@ import { daysElapsedInMonth, daysInMonth, monthPeriod, previousMonthPeriod } fro
 import { evaluateAlert, strategyFromRule, type CategoryAlert } from "@/lib/alerts/strategy";
 import { predictionTier } from "@/lib/insights/tier";
 
-const SPEND_WHERE: Prisma.TransactionWhereInput = { type: { in: ["expense", "refund"] }, duplicateOfId: null };
+// Dashboard totals strictly include confirmed (and auto-confirmed) expenses/refunds only — never unconfirmed items or top-ups.
+const CONFIRMED_SPEND_WHERE: Prisma.TransactionWhereInput = {
+  type: { in: ["expense", "refund"] },
+  purposeStatus: { in: ["auto", "confirmed"] },
+  duplicateOfId: null,
+};
 
 type Grouped = { categoryId: string | null; type: string; _sum: { amountMinor: number | null }; _count: { _all: number } };
 
@@ -30,37 +35,46 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
   const elapsed = daysElapsedInMonth(now, zone);
   const prevSameEnd = new Date(Math.min(prev.start.getTime() + elapsed * 86_400_000, prev.end.getTime()));
 
-  const [curRows, prevRows, prevFullRows, categories, pending, recent, first, lastBatch, alertRule] = await Promise.all([
-    db.transaction.groupBy({
-      by: ["categoryId", "type"],
-      where: { ...scope, ...SPEND_WHERE, occurredAt: { gte: month.start, lt: now } },
-      _sum: { amountMinor: true },
-      _count: { _all: true },
-    }),
-    db.transaction.groupBy({
-      by: ["categoryId", "type"],
-      where: { ...scope, ...SPEND_WHERE, occurredAt: { gte: prev.start, lt: prevSameEnd } },
-      _sum: { amountMinor: true },
-      _count: { _all: true },
-    }),
-    db.transaction.groupBy({
-      by: ["categoryId", "type"],
-      where: { ...scope, ...SPEND_WHERE, occurredAt: { gte: prev.start, lt: prev.end } },
-      _sum: { amountMinor: true },
-      _count: { _all: true },
-    }),
-    db.category.findMany({ where: { parentId: null } }),
-    db.transaction.count({ where: { ...scope, purposeStatus: "needs_review", duplicateOfId: null } }),
-    db.transaction.findMany({
-      where: { ...scope, duplicateOfId: null, occurredAt: { lt: now } },
-      orderBy: { occurredAt: "desc" },
-      take: 8,
-      include: { category: true, subcategory: true, source: true, purpose: true },
-    }),
-    db.transaction.findFirst({ where: scope, orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
-    db.importBatch.findFirst({ where: scope, orderBy: { createdAt: "desc" }, select: { createdAt: true } }),
-    db.alertRule.findFirst({ where: { scope: "global", enabled: true } }),
-  ]);
+  const [curRows, prevRows, prevFullRows, categories, pendingAgg, recent, first, lastBatch, alertRule] =
+    await Promise.all([
+      db.transaction.groupBy({
+        by: ["categoryId", "type"],
+        where: { ...scope, ...CONFIRMED_SPEND_WHERE, occurredAt: { gte: month.start, lt: month.end } },
+        _sum: { amountMinor: true },
+        _count: { _all: true },
+      }),
+      db.transaction.groupBy({
+        by: ["categoryId", "type"],
+        where: { ...scope, ...CONFIRMED_SPEND_WHERE, occurredAt: { gte: prev.start, lt: prevSameEnd } },
+        _sum: { amountMinor: true },
+        _count: { _all: true },
+      }),
+      db.transaction.groupBy({
+        by: ["categoryId", "type"],
+        where: { ...scope, ...CONFIRMED_SPEND_WHERE, occurredAt: { gte: prev.start, lt: prev.end } },
+        _sum: { amountMinor: true },
+        _count: { _all: true },
+      }),
+      db.category.findMany({ where: { parentId: null } }),
+      db.transaction.aggregate({
+        where: { ...scope, purposeStatus: "needs_review", duplicateOfId: null },
+        _count: { _all: true },
+        _sum: { amountMinor: true },
+      }),
+      db.transaction.findMany({
+        where: {
+          ...scope,
+          ...CONFIRMED_SPEND_WHERE,
+          OR: [{ isDemo: false }, { occurredAt: { lt: now } }],
+        },
+        orderBy: { occurredAt: "desc" },
+        take: 8,
+        include: { category: true, subcategory: true, source: true, purpose: true },
+      }),
+      db.transaction.findFirst({ where: scope, orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
+      db.importBatch.findFirst({ where: scope, orderBy: { createdAt: "desc" }, select: { createdAt: true } }),
+      db.alertRule.findFirst({ where: { scope: "global", enabled: true } }),
+    ]);
 
   const cur = netByCategory(curRows as Grouped[]);
   const prevMap = netByCategory(prevRows as Grouped[]);
@@ -100,6 +114,8 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
 
   const lastImportAt = lastBatch?.createdAt ?? settings.lastImportAt ?? null;
   const daysSinceImport = lastImportAt ? Math.floor((now.getTime() - lastImportAt.getTime()) / 86_400_000) : null;
+  const pending = pendingAgg._count._all;
+  const pendingTotalMinor = pendingAgg._sum.amountMinor ?? 0;
 
   return {
     month,
@@ -113,6 +129,7 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
     byCategory,
     alerts: byCategory.map((c) => c.alert).filter((a): a is CategoryAlert => a !== null),
     pending,
+    pendingTotalMinor,
     recent,
     lastImportAt,
     daysSinceImport,

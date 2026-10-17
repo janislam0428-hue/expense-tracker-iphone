@@ -34,7 +34,7 @@ export default async function DashboardPage() {
   const change = changeLabel(o.totalMinor, o.prevSameDaysMinor);
   const maxCat = o.byCategory[0]?.netMinor ?? 1;
   const importOverdue = o.daysSinceImport === null || o.daysSinceImport >= 7;
-  const hasAny = o.recent.length > 0;
+  const hasAny = o.recent.length > 0 || o.pending > 0;
 
   return (
     <div className="flex flex-col gap-8">
@@ -67,7 +67,11 @@ export default async function DashboardPage() {
       ) : (
         <>
           <section aria-label="Summary" className="grid grid-cols-2 gap-3 lg:grid-cols-3">
-            <StatCard label="Spent so far" value={formatMoney(o.totalMinor, cur, { decimals: false })} hint={`${o.transactionCount} transactions`} />
+            <StatCard
+              label="Spent so far"
+              value={formatMoney(o.totalMinor, cur, { decimals: false })}
+              hint={`${o.transactionCount} confirmed transaction${o.transactionCount === 1 ? "" : "s"}`}
+            />
             <StatCard
               label="vs last month"
               value={
@@ -77,7 +81,7 @@ export default async function DashboardPage() {
               }
               hint={`${formatMoney(o.prevSameDaysMinor, cur, { decimals: false })} in the same ${o.elapsed} days`}
             />
-            <StatCard label="Average per day" value={formatMoney(o.avgPerDayMinor, cur, { decimals: false })} hint="Top ups and transfers not counted" />
+            <StatCard label="Average per day" value={formatMoney(o.avgPerDayMinor, cur, { decimals: false })} hint="Confirmed expenses only" />
             <StatCard
               label="Top category"
               value={<span className="text-[17px]">{o.topCategory?.name ?? "None yet"}</span>}
@@ -86,7 +90,11 @@ export default async function DashboardPage() {
             <StatCard
               label="To confirm"
               value={o.pending}
-              hint={o.pending > 0 ? "Tap to review" : "All clear"}
+              hint={
+                o.pending > 0
+                  ? `~${formatMoney(o.pendingTotalMinor, cur, { decimals: false })} awaiting confirmation`
+                  : "All clear"
+              }
               href="/review"
               tone={o.pending > 0 ? "attention" : "default"}
             />
@@ -163,7 +171,7 @@ export default async function DashboardPage() {
           <section aria-labelledby="recent">
             <div className="mb-2 flex items-baseline justify-between">
               <h2 id="recent" className="text-[15px] font-medium">
-                Recent transactions
+                Recent confirmed transactions
               </h2>
               <Link href="/transactions" className="text-[13px] text-muted-foreground hover:text-foreground">
                 View all

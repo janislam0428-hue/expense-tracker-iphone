@@ -13,6 +13,7 @@ export default async function TransactionsPage() {
   const where = {
     ...demoScope(settings),
     duplicateOfId: null,
+    type: { not: "top_up" },
     OR: [{ isDemo: false }, { occurredAt: { lt: new Date() } }],
   };
 
