@@ -5,6 +5,7 @@ import { formatMoney } from "@/lib/money";
 import { formatInZone } from "@/lib/time";
 import { parseNotification, type ParsedNotification } from "./notification";
 import type { Channel } from "@/lib/domain";
+import { classifyMerchant } from "@/lib/reference/classify";
 
 export type IngestResult = {
   ok: boolean;
@@ -77,10 +78,12 @@ export async function ingestNotificationRecord(
     parsed.merchantNormalized.includes(r.pattern.toLowerCase().trim()),
   );
 
-  let categoryId: string | null = matchedRule?.categoryId ?? null;
-  let subcategoryId: string | null = null;
+  // A remembered rule may point to a child category; expand it into the pair.
+  let categoryId: string | null = matchedRule?.category?.parentId ?? matchedRule?.categoryId ?? null;
+  let subcategoryId: string | null = matchedRule?.category?.parentId ? matchedRule.categoryId : null;
   let purposeId: string | null = matchedRule?.purposeId ?? null;
 
+  const hint = classifyMerchant(parsed.merchantNormalized);
   // If no rule matched, attempt keyword category match
   if (!categoryId) {
     const categories = await db.category.findMany({ where: { archived: false } });
@@ -93,46 +96,26 @@ export async function ingestNotificationRecord(
       );
       if (transferCat) categoryId = transferCat.id;
     } else {
-      const m = parsed.merchantNormalized;
-      if (/bus|kmb|mtr|citybus|transit|train|minibus|ferry|tram|taxi|九巴|港鐵|巴士|小巴|電車|渡輪/i.test(m)) {
-        const transCat = categories.find((c) => c.name === "Transport" && !c.parentId);
-        if (transCat) {
-          categoryId = transCat.id;
-          // Auto-assign Personal purpose for transit
-          if (!purposeId) {
-            const personal = await db.purpose.findFirst({ where: { name: "Personal" } });
-            if (personal) purposeId = personal.id;
-          }
-          // Match subcategory (Bus, MTR, etc.)
-          const subName = /train|mtr|transit|港鐵/i.test(m)
-            ? "MTR"
-            : /bus|kmb|citybus|九巴|巴士/i.test(m)
-              ? "Bus"
-              : /minibus|小巴/i.test(m)
-                ? "Minibus"
-                : null;
-          if (subName) {
-            const subCat = categories.find((c) => c.parentId === transCat.id && c.name === subName);
-            if (subCat) subcategoryId = subCat.id;
-          }
-        }
-      } else if (/starbucks|coffee|cafe|mcdonald|restaurant|tsui wah|tamjai|din tai fung/i.test(m)) {
-        const dinCat = categories.find((c) => c.name === "Dining" && !c.parentId);
-        if (dinCat) categoryId = dinCat.id;
-      } else if (/parknshop|wellcome|7 eleven|circle k|market|supermarket/i.test(m)) {
-        const grocCat = categories.find((c) => c.name === "Groceries" && !c.parentId);
-        if (grocCat) categoryId = grocCat.id;
-      } else if (/^purchase$/i.test(m)) {
-        // Generic Octopus retail "Purchase" from Apple Wallet -> Other (ambiguous so user can confirm)
-        const otherCat = categories.find((c) => c.name === "Other" && !c.parentId);
-        if (otherCat) categoryId = otherCat.id;
-      }
+      const parent = hint && categories.find((c) => c.name === hint.category && !c.parentId);
+      if (parent) categoryId = parent.id;
     }
   }
 
   const category = categoryId
     ? await db.category.findUnique({ where: { id: categoryId } })
     : null;
+
+  // Fill a subcategory only when the hint agrees with the chosen category.
+  if (!subcategoryId && hint?.category === category?.name && hint?.subcategory) {
+    const child = await db.category.findFirst({
+      where: { parentId: categoryId, name: hint.subcategory, archived: false },
+    });
+    subcategoryId = child?.id ?? null;
+  }
+  if (!purposeId && category?.name === "Transport") {
+    const personal = await db.purpose.findUnique({ where: { name: "Personal" } });
+    purposeId = personal?.id ?? null;
+  }
 
   // 3. Decide review status
   const review = decideReview({
