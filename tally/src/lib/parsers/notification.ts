@@ -1,7 +1,10 @@
-// Zero-credit on-device/local notification parser.
-// Designed for iPhone 14 Pro notification pop-outs (Wallet, Octopus, PayMe, bank SMS/alerts),
-// Lock Screen / Notification Center stacks, and Apple Wallet / Octopus App history screenshots.
-// Runs in <1ms without any LLM API calls, completely eliminating API token/credit costs.
+// Zero-credit on-device/local notification & screenshot parser.
+// Supports:
+//  1. Apple Wallet & Lock Screen Octopus notifications & "Latest Transactions" screenshots
+//  2. PayMe App transaction history screenshots & Gmail App (popup banners, inbox list, and opened emails)
+//  3. Hang Seng Bank App transaction history screenshots & Gmail App e-Alert emails/banners
+// Automatically filters out remaining balances, Octopus top-ups, and PayMe bank top-ups
+// (including "LAM JANIS SZE YUET HKDD5326818092" and "APPLEPAY OCTOPUS CAR").
 
 import { normalizeMerchant } from "@/lib/text";
 import { addZonedDays, zonedDate, zonedParts } from "@/lib/time";
@@ -99,12 +102,22 @@ export function isBalanceLine(line: string): boolean {
 }
 
 /**
- * Checks whether a line is a top-up / reload / value-add statement
- * so it is NEVER included in spending transactions.
+ * Checks whether a line or merchant is a top-up / reload / self-funding transfer:
+ * - Explicit "+ 655.40" or "+HK$100.00"
+ * - "Top up", "Add value", "Reload", "Auto top-up", "AAV", "增值", "自動增值"
+ * - Hang Seng -> PayMe direct debit top-ups: "LAM JANIS SZE YUET", "HKDD5326818092", "HKDD..."
+ * - Hang Seng / Apple Pay -> Octopus top-ups: "APPLEPAY OCTOPUS", "OCTOPUS CAR", "OCTOPUS CARD"
+ * - PayMe bank top-up subtitle: "Hang Seng Bank Lim... **0882"
  */
 export function isTopUpLine(line: string): boolean {
-  if (/([+])\s*(?:HKD|HK\$|\$)\s*[0-9,]+(?:\.[0-9]{1,2})?/i.test(line)) return true;
-  return /\b(?:top-?up|add value|reload|auto top-?up|aav|octopus top up|增值|自動增值)\b/i.test(line);
+  const s = line.trim();
+  if (/^\+\s*(?:HKD|HK\$|\$)?\s*[0-9,]+(?:\.[0-9]{1,2})?(?:\s*HKD)?$/i.test(s)) return true;
+  if (/([+])\s*(?:HKD|HK\$|\$)\s*[0-9,]+(?:\.[0-9]{1,2})?/i.test(s)) return true;
+  if (/\b(?:top-?up|topped up|add value|added value|reload|auto top-?up|aav|octopus top up|增值|自動增值)\b/i.test(s))
+    return true;
+  if (/\b(?:lam janis|sze yuet|hkdd\d+|applepay octopus|octopus car|octopus card)\b/i.test(s)) return true;
+  if (/hang seng bank lim.*\*\*\d{4}/i.test(s)) return true;
+  return false;
 }
 
 /**
@@ -118,8 +131,8 @@ function extractBalanceMinor(line: string): number | undefined {
 }
 
 /**
- * Resolves any date, relative weekday, or timestamp label into a concrete Date in Hong Kong time:
- * - Explicit dates (>1 week ago): "2026-10-07", "07/10/2026", "7 Oct 2026", "Oct 7", "10月7日"
+ * Resolves any date, relative weekday, bank date code ("14OCT"), or timestamp label into a concrete Date in Hong Kong time:
+ * - Explicit dates (>1 week ago): "2026-10-07", "23:50 10/10/2026", "07/10/2026", "7 Oct 2026", "14OCT", "10月7日"
  * - Weekdays (within past 7 days): "Tuesday", "Wednesday", "Thu 18:56", "Wed 22:34"
  * - Relative offsets: "1h ago", "25m ago", "Today", "Yesterday", "15:33"
  */
@@ -129,36 +142,44 @@ export function resolveRelativeDay(
   itemIndex = 0,
 ): { date: Date; precision: DatePrecision } {
   if (!label) return { date: new Date(refDate.getTime() - itemIndex * 1000), precision: "minute" };
-  const raw = label.trim().replace(/^(?:Octopus|Wallet|Apple Pay|PayMe)\s+/i, "").trim();
+  const raw = label.trim().replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\s+/i, "").trim();
   const clean = raw.toLowerCase();
   const p = zonedParts(refDate);
   const minuteOffset = Math.max(0, 59 - itemIndex);
 
-  // 1. Explicit ISO date: YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD (with optional HH:mm)
-  let m = raw.match(/\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/);
+  // 1. Explicit ISO date: YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD (with optional HH:mm before or after)
+  let m = raw.match(
+    /(?:(\d{1,2}):(\d{2})\s+)?\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/,
+  );
   if (m) {
-    const year = parseInt(m[1], 10);
-    const month = parseInt(m[2], 10);
-    const day = parseInt(m[3], 10);
-    const hasTime = m[4] !== undefined && m[5] !== undefined;
-    const hour = hasTime ? parseInt(m[4], 10) : 12;
-    const minute = hasTime ? parseInt(m[5], 10) : minuteOffset;
+    const year = parseInt(m[3], 10);
+    const month = parseInt(m[4], 10);
+    const day = parseInt(m[5], 10);
+    const hStr = m[1] ?? m[6];
+    const minStr = m[2] ?? m[7];
+    const hasTime = hStr !== undefined && minStr !== undefined;
+    const hour = hasTime ? parseInt(hStr, 10) : 12;
+    const minute = hasTime ? parseInt(minStr, 10) : minuteOffset;
     return {
       date: zonedDate(year, month, day, hour, minute),
       precision: hasTime ? "minute" : "date_only",
     };
   }
 
-  // 2. Explicit DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY (standard Hong Kong date format, >1 week ago)
-  m = raw.match(/\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-](20\d{2}|\d{2})(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/);
+  // 2. Explicit DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY (with optional HH:mm before or after, e.g. "23:50 10/10/2026")
+  m = raw.match(
+    /(?:(\d{1,2}):(\d{2})\s+)?\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-](20\d{2}|\d{2})(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/,
+  );
   if (m) {
-    const day = parseInt(m[1], 10);
-    const month = parseInt(m[2], 10);
-    const yrRaw = parseInt(m[3], 10);
+    const day = parseInt(m[3], 10);
+    const month = parseInt(m[4], 10);
+    const yrRaw = parseInt(m[5], 10);
     const year = yrRaw < 100 ? 2000 + yrRaw : yrRaw;
-    const hasTime = m[4] !== undefined && m[5] !== undefined;
-    const hour = hasTime ? parseInt(m[4], 10) : 12;
-    const minute = hasTime ? parseInt(m[5], 10) : minuteOffset;
+    const hStr = m[1] ?? m[6];
+    const minStr = m[2] ?? m[7];
+    const hasTime = hStr !== undefined && minStr !== undefined;
+    const hour = hasTime ? parseInt(hStr, 10) : 12;
+    const minute = hasTime ? parseInt(minStr, 10) : minuteOffset;
     return {
       date: zonedDate(year, month, day, hour, minute),
       precision: hasTime ? "minute" : "date_only",
@@ -180,10 +201,11 @@ export function resolveRelativeDay(
     };
   }
 
-  // 4. Explicit Month Name date: "7 Oct 2026", "7 Oct", "17 Oct, 20:18", "Oct 7, 2026", "Oct 7"
+  // 4. Explicit Month Name date or attached bank date code:
+  //    "7 Oct 2026", "08 Oct 2026", "14OCT", "11OCT", "Oct 7, 2026"
   m =
     raw.match(
-      /\b(?:mon|tue|wed|thu|fri|sat|sun)?\s*,?\s*(0?[1-9]|[12]\d|3[01])\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*(?:\s*,?\s*(20\d{2}))?(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/i,
+      /\b(?:mon|tue|wed|thu|fri|sat|sun)?\s*,?\s*(0?[1-9]|[12]\d|3[01])\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*(?:\s*,?\s*(20\d{2}))?(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/i,
     ) ??
     raw.match(
       /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(0?[1-9]|[12]\d|3[01])(?:\s*,?\s*(20\d{2}))?(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/i,
@@ -231,7 +253,6 @@ export function resolveRelativeDay(
     const targetDow = WEEKDAY_INDEX[dayToken];
     if (targetDow !== undefined) {
       let diff = (p.weekday - targetDow + 7) % 7;
-      // If same weekday but the time is in the future relative to refDate, it was 7 days ago
       if (diff === 0 && (hour > p.hour || (hour === p.hour && minute > p.minute))) {
         diff = 7;
       }
@@ -248,8 +269,8 @@ export function resolveRelativeDay(
     return { date: zonedDate(p.year, p.month, p.day, hour, minute), precision: "minute" };
   }
 
-  // 8. "Today" / "Yesterday"
-  if (clean === "today" || clean === "今日" || clean === "今天") {
+  // 8. "Today" / "Yesterday" / "now"
+  if (clean === "today" || clean === "now" || clean === "今日" || clean === "今天") {
     return { date: zonedDate(p.year, p.month, p.day, 12, minuteOffset), precision: "date_only" };
   }
   if (clean === "yesterday" || clean === "昨日" || clean === "昨天") {
@@ -261,7 +282,6 @@ export function resolveRelativeDay(
   const targetDow = WEEKDAY_INDEX[clean];
   if (targetDow !== undefined) {
     let diff = (p.weekday - targetDow + 7) % 7;
-    // In Apple Wallet, today is labeled "Today"; a weekday name matching today is 7 days ago
     if (diff === 0) diff = 7;
     const resolved = addZonedDays(zonedDate(p.year, p.month, p.day, 12, minuteOffset), -diff);
     return { date: resolved, precision: "inferred_weekday" };
@@ -274,15 +294,19 @@ export function resolveRelativeDay(
  * Checks if a string is purely a date, weekday, or timestamp (and NOT a merchant name).
  */
 export function isDateOrTimestampLabel(text: string): boolean {
-  const s = text.trim().replace(/^(?:Octopus|Wallet|Apple Pay|PayMe)\s+/i, "").trim();
+  const s = text.trim().replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\s+/i, "").trim();
   if (!s) return false;
   if (/^\d{4}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])(?:\s*,?\s*\d{1,2}:\d{2})?$/.test(s)) return true;
-  if (/^(?:0?[1-9]|[12]\d|3[01])[/-](?:0?[1-9]|1[0-2])[/-](?:20\d{2}|\d{2})(?:\s*,?\s*\d{1,2}:\d{2})?$/.test(s))
+  if (
+    /^(?:\d{1,2}:\d{2}\s+)?(?:0?[1-9]|[12]\d|3[01])[/-](?:0?[1-9]|1[0-2])[/-](?:20\d{2}|\d{2})(?:\s*,?\s*\d{1,2}:\d{2})?$/.test(
+      s,
+    )
+  )
     return true;
   if (/^(?:20\d{2}年)?\s*(?:0?[1-9]|1[0-2])月\s*(?:0?[1-9]|[12]\d|3[01])[日號]?(?:\s*\d{1,2}:\d{2})?$/.test(s))
     return true;
   if (
-    /^(?:(?:mon|tue|wed|thu|fri|sat|sun)\s*,?\s*)?(?:0?[1-9]|[12]\d|3[01])\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*(?:\s*,?\s*20\d{2})?(?:\s*,?\s*\d{1,2}:\d{2})?$/i.test(
+    /^(?:(?:mon|tue|wed|thu|fri|sat|sun)\s*,?\s*)?(?:0?[1-9]|[12]\d|3[01])\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*(?:\s*,?\s*20\d{2})?(?:\s*,?\s*\d{1,2}:\d{2})?$/i.test(
       s,
     )
   )
@@ -295,7 +319,7 @@ export function isDateOrTimestampLabel(text: string): boolean {
     return true;
   if (/^\d+\s*(?:h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\s*ago$/i.test(s)) return true;
   if (
-    /^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|yesterday|今日|今天|昨日|昨天|週[一二三四五六日]|星期[一二三四五六日])(?:\s*,?\s*\d{1,2}:\d{2})?$/i.test(
+    /^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|yesterday|now|今日|今天|昨日|昨天|週[一二三四五六日]|星期[一二三四五六日])(?:\s*,?\s*\d{1,2}:\d{2})?$/i.test(
       s,
     )
   )
@@ -311,16 +335,17 @@ function splitDateFromText(line: string): { dateLabel: string | null; remainingT
   const s = line.trim();
   if (isDateOrTimestampLabel(s)) {
     return {
-      dateLabel: s.replace(/^(?:Octopus|Wallet|Apple Pay|PayMe)\s+/i, "").trim(),
+      dateLabel: s.replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\s+/i, "").trim(),
       remainingText: "",
     };
   }
 
   const patterns = [
+    /\b((?:\d{1,2}:\d{2}\s+)?(?:0?[1-9]|[12]\d|3[01])[/-](?:0?[1-9]|1[0-2])[/-](?:20\d{2}|\d{2})(?:\s*,?\s*\d{1,2}:\d{2})?)\b/i,
     /\b(20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])(?:\s*,?\s*\d{1,2}:\d{2})?)\b/i,
-    /\b((?:0?[1-9]|[12]\d|3[01])[/-](?:0?[1-9]|1[0-2])[/-](?:20\d{2}|\d{2})(?:\s*,?\s*\d{1,2}:\d{2})?)\b/i,
     /((?:20\d{2}年)?\s*(?:0?[1-9]|1[0-2])月\s*(?:0?[1-9]|[12]\d|3[01])[日號]?(?:\s*\d{1,2}:\d{2})?)/i,
     /\b((?:0?[1-9]|[12]\d|3[01])\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*(?:\s*,?\s*20\d{2})?(?:\s*,?\s*\d{1,2}:\d{2})?)\b/i,
+    /\b((?:0?[1-9]|[12]\d|3[01])(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b/i,
     /\b((?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(?:0?[1-9]|[12]\d|3[01])(?:\s*,?\s*20\d{2})?(?:\s*,?\s*\d{1,2}:\d{2})?)\b/i,
     /\b(\d+\s*(?:h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\s*ago)\b/i,
     /\b((?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|yesterday|今日|今天|昨日|昨天|週[一二三四五六日]|星期[一二三四五六日])\s*,?\s*\d{1,2}:\d{2})\b/i,
@@ -333,7 +358,7 @@ function splitDateFromText(line: string): { dateLabel: string | null; remainingT
       const dateLabel = m[1].trim();
       const remainingText = s
         .replace(m[0], " ")
-        .replace(/^(?:Octopus|Wallet|Apple Pay)\b/i, "")
+        .replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\b/i, "")
         .replace(/\s+/g, " ")
         .replace(/^[-–—:·.\s]+|[-–—:·.\s]+$/g, "")
         .trim();
@@ -345,15 +370,397 @@ function splitDateFromText(line: string): { dateLabel: string | null; remainingT
 }
 
 /**
+ * Parses one or more PayMe by HSBC email notifications from the Gmail App:
+ * - Gmail push notification banner ("PayMe by HSBC now / You paid Claudia Yue / Transaction Transaction You paid Claudia Yue - HKD 2 Payment 23:50 10/10/2026...")
+ * - Gmail App inbox / search results list showing multiple PayMe email snippets on one screen
+ * - Opened PayMe email body inside the Gmail App
+ */
+export function parsePayMeEmailNotifications(text: string, refDate = new Date()): ParsedNotification[] {
+  if (!text) return [];
+  const flat = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+
+  const regex =
+    /(?:You(?:'ve)? paid|paid|已付款給|付款給)\s+([A-Za-z0-9\u4e00-\u9fa5 .&'*_-]+?)\s*[-–—]\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)(?:\s+(.*?))?(?:\s+(\d{1,2}:\d{2}\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+\d{1,2}:\d{2}))?(?=\s+If you didn't|\s+Please contact|\s+Transaction reference|\s+PayMe by HSBC|\s+You(?:'ve)? paid|$)/gi;
+
+  const results: ParsedNotification[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(flat)) !== null) {
+    const rawMerchant = match[1]
+      .replace(/^(?:Transaction\s+)+/i, "")
+      .replace(/^(?:You(?:'ve)? paid\s+)+/i, "")
+      .trim();
+    if (!rawMerchant || isTopUpLine(rawMerchant) || isDateOrTimestampLabel(rawMerchant)) continue;
+
+    const amountMinor = Math.round(parseFloat(match[2].replace(/,/g, "")) * 100);
+    if (amountMinor <= 0) continue;
+
+    const rawNote = match[3]?.trim();
+    const tsRaw = match[4]?.trim();
+    const resolved = resolveRelativeDay(tsRaw, refDate, results.length);
+    const isP2P = !/Starbucks|Pacific Coffee|7-Eleven|Circle K|HKTVmall|store|shop|patisserie|café|cafe|bakery|ltd|limited/i.test(
+      rawMerchant,
+    );
+
+    const cleanNote =
+      rawNote &&
+      rawNote.toLowerCase() !== "payment" &&
+      rawNote.length <= 60 &&
+      !/transaction reference|customer service/i.test(rawNote)
+        ? rawNote
+        : undefined;
+
+    results.push({
+      amountMinor,
+      currency: "HKD",
+      merchant: rawMerchant,
+      merchantNormalized: normalizeMerchant(rawMerchant),
+      counterparty: isP2P ? rawMerchant : undefined,
+      description: cleanNote,
+      type: "expense",
+      sourceName: "PayMe",
+      sourceKind: "payme",
+      occurredAt: resolved.date,
+      datePrecision: tsRaw ? "minute" : "date_only",
+      isPersonToPerson: isP2P,
+      confidence: 0.99,
+      rawText: match[0].slice(0, 240),
+    });
+  }
+
+  return results;
+}
+
+export function parsePayMeEmailNotification(text: string, refDate = new Date()): ParsedNotification | null {
+  const list = parsePayMeEmailNotifications(text, refDate);
+  return list[0] ?? null;
+}
+
+/**
+ * Parses Hang Seng Bank App transaction history screenshots (e.g. "02cfbc71.jpeg").
+ * Automatically skips PayMe top-ups ("LAM JANIS SZE YUET HKDD5326818092") and Octopus top-ups ("APPLEPAY OCTOPUS CAR").
+ */
+export function parseHangSengHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
+  if (!text) return [];
+  if (
+    !/-[0-9,]+\.[0-9]{2}\s*HKD\b/i.test(text) &&
+    !/\b\d{1,2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+HKD\b/i.test(text)
+  ) {
+    return [];
+  }
+
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const navNoise = /^(?:home|transfer\s*&\s*pay|wealth|credit cards|all|in|out|\d{1,2}:\d{2})$/i;
+  const items: ParsedNotification[] = [];
+  let currentHeaderDateLabel: string | null = null;
+  let pendingDescLine: string | null = null;
+  let skipNextAmountLine = false;
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    if (navNoise.test(line)) continue;
+
+    if (isDateOrTimestampLabel(line)) {
+      currentHeaderDateLabel = line;
+      pendingDescLine = null;
+      skipNextAmountLine = false;
+      continue;
+    }
+
+    if (isTopUpLine(line)) {
+      pendingDescLine = null;
+      if (!/-[0-9,]+\.[0-9]{2}\s*HKD$/i.test(line)) {
+        skipNextAmountLine = true;
+      }
+      continue;
+    }
+
+    const standaloneAmt = line.match(/^([+-]?)\s*([0-9,]+\.[0-9]{2})\s*HKD$/i);
+    if (standaloneAmt) {
+      if (skipNextAmountLine || standaloneAmt[1] === "+") {
+        skipNextAmountLine = false;
+        pendingDescLine = null;
+        continue;
+      }
+      if (pendingDescLine) {
+        const amountMinor = Math.round(parseFloat(standaloneAmt[2].replace(/,/g, "")) * 100);
+        const descSplit = splitDateFromText(
+          pendingDescLine
+            .replace(/\bHKD\s*[0-9,]+(?:\.[0-9]{1,2})?\b/gi, "")
+            .replace(/^(?:CUP|VISA|MASTER)\s+/i, "")
+            .trim(),
+        );
+        const merchant = descSplit.remainingText || "Hang Seng Purchase";
+        const effectiveDateLabel = descSplit.dateLabel ?? currentHeaderDateLabel;
+        const resolved = resolveRelativeDay(effectiveDateLabel, refDate, items.length);
+
+        items.push({
+          amountMinor,
+          currency: "HKD",
+          merchant,
+          merchantNormalized: normalizeMerchant(merchant),
+          type: "expense",
+          sourceName: "Hang Seng Card",
+          sourceKind: "credit_card",
+          occurredAt: resolved.date,
+          datePrecision: resolved.precision,
+          isPersonToPerson: false,
+          confidence: 0.96,
+          rawText: `${pendingDescLine} (${line})`,
+        });
+        pendingDescLine = null;
+      }
+      continue;
+    }
+
+    const sameLineMatch = line.match(/^(.+?)\s+([+-]?)\s*([0-9,]+\.[0-9]{2})\s*HKD$/i);
+    if (sameLineMatch) {
+      const sign = sameLineMatch[2];
+      const rawDesc = sameLineMatch[1].trim();
+      if (sign === "+" || isTopUpLine(rawDesc)) {
+        pendingDescLine = null;
+        skipNextAmountLine = false;
+        continue;
+      }
+      const amountMinor = Math.round(parseFloat(sameLineMatch[3].replace(/,/g, "")) * 100);
+      const descSplit = splitDateFromText(
+        rawDesc
+          .replace(/\bHKD\s*[0-9,]+(?:\.[0-9]{1,2})?\b/gi, "")
+          .replace(/^(?:CUP|VISA|MASTER)\s+/i, "")
+          .trim(),
+      );
+      const merchant = descSplit.remainingText || "Hang Seng Purchase";
+      const effectiveDateLabel = descSplit.dateLabel ?? currentHeaderDateLabel;
+      const resolved = resolveRelativeDay(effectiveDateLabel, refDate, items.length);
+
+      items.push({
+        amountMinor,
+        currency: "HKD",
+        merchant,
+        merchantNormalized: normalizeMerchant(merchant),
+        type: "expense",
+        sourceName: "Hang Seng Card",
+        sourceKind: "credit_card",
+        occurredAt: resolved.date,
+        datePrecision: resolved.precision,
+        isPersonToPerson: false,
+        confidence: 0.96,
+        rawText: line,
+      });
+      pendingDescLine = null;
+      skipNextAmountLine = false;
+      continue;
+    }
+
+    pendingDescLine = line;
+    skipNextAmountLine = false;
+
+    const nextLine = i + 1 < rawLines.length ? rawLines[i + 1] : "";
+    if (!/^([+-]?)\s*([0-9,]+\.[0-9]{2})\s*HKD$/i.test(nextLine)) {
+      const embeddedHkd = line.match(/^(.+?)\s+HKD\s*([0-9,]+\.[0-9]{2})$/i);
+      if (embeddedHkd && !isTopUpLine(line)) {
+        const amountMinor = Math.round(parseFloat(embeddedHkd[2].replace(/,/g, "")) * 100);
+        const descSplit = splitDateFromText(
+          embeddedHkd[1].replace(/^(?:CUP|VISA|MASTER)\s+/i, "").trim(),
+        );
+        const merchant = descSplit.remainingText || "Hang Seng Purchase";
+        const effectiveDateLabel = descSplit.dateLabel ?? currentHeaderDateLabel;
+        const resolved = resolveRelativeDay(effectiveDateLabel, refDate, items.length);
+
+        items.push({
+          amountMinor,
+          currency: "HKD",
+          merchant,
+          merchantNormalized: normalizeMerchant(merchant),
+          type: "expense",
+          sourceName: "Hang Seng Card",
+          sourceKind: "credit_card",
+          occurredAt: resolved.date,
+          datePrecision: resolved.precision,
+          isPersonToPerson: false,
+          confidence: 0.94,
+          rawText: line,
+        });
+        pendingDescLine = null;
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Parses PayMe App transaction history screenshots (e.g. "c1de4956.jpeg" and "cd8e9659.jpeg").
+ */
+export function parsePayMeAppHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
+  if (!text) return [];
+  const hasSignedAmounts = /(?:^|\s)[+-]\s*[0-9,]+\.[0-9]{2}(?:\s|$)/m.test(text);
+  const hasPayMeSignals =
+    /pay businesses|hang seng bank lim.*\*\*\d{4}|\btop up\b/i.test(text) ||
+    (/(?:^|\n)\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+20\d{2}/i.test(text) &&
+      hasSignedAmounts &&
+      !/\bHKD\b/i.test(text));
+
+  if (!hasSignedAmounts || !hasPayMeSignals) return [];
+
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const navNoise =
+    /^(?:home|friends|pay businesses|notifications|me|\d{1,2}:\d{2}|all|money in|money out)$/i;
+
+  let firstVisibleDateLabel: string | null = null;
+  for (const l of rawLines) {
+    if (isDateOrTimestampLabel(l) && !/^\d{1,2}:\d{2}$/.test(l)) {
+      firstVisibleDateLabel = l;
+      break;
+    }
+  }
+
+  const items: ParsedNotification[] = [];
+  let currentDateLabel: string | null = firstVisibleDateLabel;
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    if (navNoise.test(line)) continue;
+
+    if (isDateOrTimestampLabel(line)) {
+      if (i > 0 || !/^\d{1,2}:\d{2}$/.test(line)) {
+        currentDateLabel = line;
+      }
+      continue;
+    }
+
+    const sameLine = line.match(/^(.+?)\s+([+-])\s*([0-9,]+\.[0-9]{2})$/);
+    if (sameLine) {
+      const name = sameLine[1].trim();
+      const sign = sameLine[2];
+      const amtStr = sameLine[3];
+
+      let note: string | undefined = undefined;
+      if (
+        i + 1 < rawLines.length &&
+        !isDateOrTimestampLabel(rawLines[i + 1]) &&
+        !navNoise.test(rawLines[i + 1]) &&
+        !/([+-])\s*[0-9,]+\.[0-9]{2}$/.test(rawLines[i + 1]) &&
+        !(i + 2 < rawLines.length && /^[+-]\s*[0-9,]+\.[0-9]{2}$/.test(rawLines[i + 2]))
+      ) {
+        note = rawLines[i + 1];
+        i += 1;
+      }
+
+      if (sign === "+" || isTopUpLine(name) || (note && isTopUpLine(note))) {
+        continue;
+      }
+
+      const amountMinor = Math.round(parseFloat(amtStr.replace(/,/g, "")) * 100);
+      if (amountMinor <= 0) continue;
+
+      const resolved = resolveRelativeDay(currentDateLabel, refDate, items.length);
+      const isP2P = !/Starbucks|Pacific Coffee|7-Eleven|Circle K|HKTVmall|store|shop|patisserie|café|cafe|bakery|ltd|limited/i.test(
+        name,
+      );
+
+      items.push({
+        amountMinor,
+        currency: "HKD",
+        merchant: name,
+        merchantNormalized: normalizeMerchant(name),
+        counterparty: isP2P ? name : undefined,
+        description: note && note.toLowerCase() !== "payment" ? note : undefined,
+        type: "expense",
+        sourceName: "PayMe",
+        sourceKind: "payme",
+        occurredAt: resolved.date,
+        datePrecision: resolved.precision,
+        isPersonToPerson: isP2P,
+        confidence: 0.96,
+        rawText: [name, note, currentDateLabel, `${sign}${amtStr}`].filter(Boolean).join(" · "),
+      });
+      continue;
+    }
+
+    const standaloneSigned = line.match(/^([+-])\s*([0-9,]+\.[0-9]{2})$/);
+    if (standaloneSigned) {
+      const sign = standaloneSigned[1];
+      const amtStr = standaloneSigned[2];
+
+      let name = "";
+      let note: string | undefined = undefined;
+      const prev1 = i - 1 >= 0 ? rawLines[i - 1] : "";
+      const prev2 = i - 2 >= 0 ? rawLines[i - 2] : "";
+
+      if (
+        prev2 &&
+        !isDateOrTimestampLabel(prev2) &&
+        !navNoise.test(prev2) &&
+        !/[+-]\s*[0-9,]+\.[0-9]{2}/.test(prev2) &&
+        !isDateOrTimestampLabel(prev1)
+      ) {
+        name = prev2;
+        note = prev1;
+      } else if (prev1 && !isDateOrTimestampLabel(prev1) && !navNoise.test(prev1)) {
+        name = prev1;
+        if (
+          i + 1 < rawLines.length &&
+          !isDateOrTimestampLabel(rawLines[i + 1]) &&
+          !navNoise.test(rawLines[i + 1]) &&
+          !/[+-]\s*[0-9,]+\.[0-9]{2}/.test(rawLines[i + 1]) &&
+          !(i + 2 < rawLines.length && /^[+-]\s*[0-9,]+\.[0-9]{2}$/.test(rawLines[i + 2]))
+        ) {
+          note = rawLines[i + 1];
+          i += 1;
+        }
+      }
+
+      if (sign === "+" || !name || isTopUpLine(name) || (note && isTopUpLine(note))) {
+        continue;
+      }
+
+      const amountMinor = Math.round(parseFloat(amtStr.replace(/,/g, "")) * 100);
+      if (amountMinor <= 0) continue;
+
+      const resolved = resolveRelativeDay(currentDateLabel, refDate, items.length);
+      const isP2P = !/Starbucks|Pacific Coffee|7-Eleven|Circle K|HKTVmall|store|shop|patisserie|café|cafe|bakery|ltd|limited/i.test(
+        name,
+      );
+
+      items.push({
+        amountMinor,
+        currency: "HKD",
+        merchant: name,
+        merchantNormalized: normalizeMerchant(name),
+        counterparty: isP2P ? name : undefined,
+        description: note && note.toLowerCase() !== "payment" ? note : undefined,
+        type: "expense",
+        sourceName: "PayMe",
+        sourceKind: "payme",
+        occurredAt: resolved.date,
+        datePrecision: resolved.precision,
+        isPersonToPerson: isP2P,
+        confidence: 0.96,
+        rawText: [name, note, currentDateLabel, `${sign}${amtStr}`].filter(Boolean).join(" · "),
+      });
+    }
+  }
+
+  return items;
+}
+
+/**
  * Parses an individual single-line notification string into structured transaction data.
- * Top-ups and remaining balance lines are strictly ignored so they never inflate spending totals.
  */
 export function parseNotification(text: string, refDate = new Date()): ParsedNotification | null {
   if (!text || typeof text !== "string") return null;
   const t = text.trim();
   if (t.length < 3) return null;
 
-  // Never parse a balance line or a top-up line as a spending transaction
   if (isBalanceLine(t) && !/(?:Paid|Spent|扣除|for\s+Bus|for\s+Train|Purchase)/i.test(t)) {
     return null;
   }
@@ -361,10 +768,12 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     return null;
   }
 
+  const paymeEmail = parsePayMeEmailNotification(t, refDate);
+  if (paymeEmail) return paymeEmail;
+
   let m: RegExpMatchArray | null;
 
-  // 1. Apple Wallet Lock Screen Octopus format:
-  //    "HK$8.70 for Bus" / "HK$4.40 for Train" / "HK$20.00 Purchase" / "Octopus HK$8.70 for Bus"
+  // 1. Apple Wallet Lock Screen Octopus format
   if (
     (m = t.match(
       /^(?:Octopus[:\s]*)?(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s+(?:for\s+([A-Za-z0-9 &/-]+)|(Purchase|零售|消費|付款))(?:\.|$)/i,
@@ -391,7 +800,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 2. Octopus Chinese Spend (e.g. "八達通: 於九巴扣除 HK$8.70。餘額 HK$350.20")
+  // 2. Octopus Chinese Spend
   if ((m = t.match(/八達通[:：]?\s*於\s*([^。，\n]+?)\s*扣除\s*HK\$?([0-9,]+(?:\.[0-9]{1,2})?)/i))) {
     const merchant = m[1].trim();
     const amountMinor = Math.round(parseFloat(m[2].replace(/,/g, "")) * 100);
@@ -413,7 +822,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 3. Octopus English Spend (e.g. "Octopus: Paid HK$8.70 at KMB Bus. Remaining balance HK$350.20")
+  // 3. Octopus English Spend
   if ((m = t.match(/Octopus:?\s*(?:Paid|Payment of|Spent|-)?\s*HK\$?([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|for)\s*([^.·\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const merchant = m[2].trim();
@@ -435,7 +844,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 4a. Apple Pay / Wallet with card AND merchant: "You paid HK$350.00 at UNIQLO with Hang Seng Card."
+  // 4a. Apple Pay / Wallet with card AND merchant
   if ((m = t.match(/(?:You paid|Paid|Spent|Payment of)\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|for)\s*([^.·\n]+?)\s+with\s+([^.]+?)(?:\.|$)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const merchant = m[2].trim();
@@ -457,7 +866,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 4b. Apple Pay / Wallet without merchant (when iOS omits Merchant in Shortcuts): "You paid HK$8.20 with Octopus"
+  // 4b. Apple Pay / Wallet without merchant
   if ((m = t.match(/(?:You paid|Paid|Spent|Payment of)?\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at\s+)?with\s+([^.·\n]+?)(?:\.|$)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const card = m[2].trim();
@@ -479,9 +888,12 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 5. PayMe Notifications (P2P and merchants)
-  // 5a. PayMe: Merchant before amount (e.g. "You've paid Karen Chan HK$150.00" / "已付款給 Karen Chan HK$150.00")
-  if ((m = t.match(/(?:You(?:'ve)? paid|paid|已付款|轉賬給|付款給)\s+([^0-9$]+?)\s+(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i))) {
+  // 5. PayMe Notifications
+  if (
+    (m = t.match(
+      /(?:You(?:'ve)? paid|paid|已付款|轉賬給|付款給)\s+([^0-9$]+?)\s*[-–—]?\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i,
+    ))
+  ) {
     const target = m[1].replace(/^(?:to|於|給|at)\s+/i, "").trim();
     if (isDateOrTimestampLabel(target)) return null;
     const amountMinor = Math.round(parseFloat(m[2].replace(/,/g, "")) * 100);
@@ -503,7 +915,6 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 5b. PayMe: Amount before merchant (e.g. "You've paid HK$150.00 to Karen Chan" / "已付款 HK$150.00 給 Karen Chan")
   if ((m = t.match(/(?:You(?:'ve)? paid|已付款)\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:to|at|給|於)\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const target = m[2].trim();
@@ -525,10 +936,14 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
-  // 6. Bank & Credit Card Notifications (HSBC, Hang Seng, Standard Chartered, Mox, ZA, Citi, BOC, DBS)
-  if ((m = t.match(/(?:HSBC|Hang Seng|Standard Chartered|Mox|ZA Bank|Citi|BOC|DBS|Credit Card|信用卡)[^:]*:[^0-9]*(?:spent|purchase of|made at|payment of|扣除|簽賬|付款)?\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:was made at|at|to|with Card ending \d+ at|於)\s*([^.。，\n]+)/i))) {
+  // 6. Bank & Credit Card Notifications / Gmail e-Alerts (HSBC, Hang Seng, Standard Chartered, Mox, ZA, Citi, BOC, DBS)
+  if ((m = t.match(/(?:HSBC|Hang Seng|Standard Chartered|Mox|ZA Bank|Citi|BOC|DBS|Credit Card|信用卡)[^:]*:?[^0-9]*(?:spent|purchase of|made at|payment of|transaction of|扣除|簽賬|付款)?\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:was made at|at|to|with Card ending \d+ at|於)\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
-    const merchant = m[2].replace(/\s+(?:on|with).*$/, "").trim();
+    const rawMerch = m[2].trim();
+    const split = splitDateFromText(rawMerch.replace(/\s+(?:on|with)\s+/i, " "));
+    const merchant = split.remainingText || rawMerch.replace(/\s+(?:on|with).*$/, "").trim();
+    if (isTopUpLine(merchant)) return null;
+    const resolved = split.dateLabel ? resolveRelativeDay(split.dateLabel, refDate, 0) : { date: refDate, precision: "minute" as DatePrecision };
     return {
       amountMinor,
       currency: "HKD",
@@ -537,19 +952,23 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
       type: "expense",
       sourceName: "Hang Seng Card",
       sourceKind: "credit_card",
-      occurredAt: refDate,
-      datePrecision: "minute",
+      occurredAt: resolved.date,
+      datePrecision: resolved.precision,
       isPersonToPerson: false,
-      confidence: 0.92,
+      confidence: 0.94,
       rawText: t,
     };
   }
 
-  // 7. Amount with destination: "HK$8.70 at KMB" / "HK$150.00 to Karen" / "$45 at Starbucks"
+  // 7. Amount with destination: "HK$8.70 at KMB" / "HKD 614.00 at KPAY*KITSUNE"
   if ((m = t.match(/(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|for|於|給)\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
-    const merchant = m[2].replace(/\s+(?:on|with).*$/, "").trim();
+    const rawMerch = m[2].trim();
+    const split = splitDateFromText(rawMerch.replace(/\s+(?:on|with)\s+/i, " "));
+    const merchant = split.remainingText || rawMerch.replace(/\s+(?:on|with).*$/, "").trim();
+    if (isTopUpLine(merchant)) return null;
     const isOctopusTransit = /^(?:bus|train|mtr|transit|minibus|ferry|tram|light rail)$/i.test(merchant);
+    const resolved = split.dateLabel ? resolveRelativeDay(split.dateLabel, refDate, 0) : { date: refDate, precision: "minute" as DatePrecision };
     return {
       amountMinor,
       currency: "HKD",
@@ -559,8 +978,8 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
       type: "expense",
       sourceName: isOctopusTransit ? "Octopus" : "Hang Seng Card",
       sourceKind: isOctopusTransit ? "octopus" : "credit_card",
-      occurredAt: refDate,
-      datePrecision: "minute",
+      occurredAt: resolved.date,
+      datePrecision: resolved.precision,
       isPersonToPerson: false,
       confidence: 0.9,
       rawText: t,
@@ -571,7 +990,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
   if ((m = t.match(/(?:spent|paid|payment of|簽賬|付款)\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|於)?\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const merchant = m[2].replace(/\s+(?:on|with).*$/, "").trim();
-    if (isDateOrTimestampLabel(merchant)) return null;
+    if (isDateOrTimestampLabel(merchant) || isTopUpLine(merchant)) return null;
     return {
       amountMinor,
       currency: "HKD",
@@ -593,8 +1012,6 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
 
 /**
  * Parses an Apple Wallet Lock Screen notification stack or "Latest Transactions" history screenshot.
- * - Never includes "Your new balance is..." or top-ups (+HK$..., Top-up, Reload, Add Value).
- * - Never mistakes dates ("2026-10-07", "07/10/2026", "7 Oct") or weekdays ("Tuesday", "Thu 18:56", "1h ago") for merchant names.
  */
 export function parseWalletHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
@@ -614,7 +1031,6 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i];
 
-    // 1. Balance statement (e.g. "Your new balance is HK$11.00.") -> attach to previous item for deduplication, never create a transaction
     if (isBalanceLine(line)) {
       const balMinor = extractBalanceMinor(line);
       if (balMinor !== undefined && items.length > 0 && items[items.length - 1].balanceAfterMinor === undefined) {
@@ -623,41 +1039,38 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       continue;
     }
 
-    // 2. Skip top-up lines completely
     if (isTopUpLine(line)) {
       pendingTimestampLabel = null;
       continue;
     }
 
-    // 3. Check if this line is purely a date, weekday, or timestamp (e.g. "2026-10-07", "Tuesday", "Octopus Thu 18:56", "1h ago")
     if (isDateOrTimestampLabel(line)) {
-      // Ignore the iPhone top-left status bar clock at index 0
       if (i > 0 || !/^\d{1,2}:\d{2}$/.test(line)) {
-        pendingTimestampLabel = line.replace(/^(?:Octopus|Wallet|Apple Pay|PayMe)\s+/i, "").trim();
+        pendingTimestampLabel = line.replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\s+/i, "").trim();
       }
       continue;
     }
 
     if (noise.test(line)) continue;
 
-    // 4. Check if the line is a direct single-line notification (e.g. "HK$8.70 for Bus" or "HK$20.00 Purchase")
     const directSingle = parseNotification(line, refDate);
     if (directSingle) {
       let tsLabel = pendingTimestampLabel;
       if (!tsLabel) {
-        // Look up to 2 lines ahead for a timestamp or date label
         for (let j = i + 1; j <= Math.min(rawLines.length - 1, i + 2); j++) {
           const nextL = rawLines[j];
           if (isBalanceLine(nextL)) continue;
           if (isDateOrTimestampLabel(nextL)) {
-            tsLabel = nextL.replace(/^(?:Octopus|Wallet|Apple Pay|PayMe)\s+/i, "").trim();
+            tsLabel = nextL.replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\s+/i, "").trim();
             break;
           }
         }
       }
-      const resolved = resolveRelativeDay(tsLabel, refDate, items.length);
-      directSingle.occurredAt = resolved.date;
-      directSingle.datePrecision = resolved.precision;
+      if (!directSingle.occurredAt || directSingle.occurredAt === refDate) {
+        const resolved = resolveRelativeDay(tsLabel, refDate, items.length);
+        directSingle.occurredAt = resolved.date;
+        directSingle.datePrecision = resolved.precision;
+      }
       if (tsLabel) {
         directSingle.rawText = `${tsLabel} · ${directSingle.rawText}`;
       }
@@ -666,13 +1079,11 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       continue;
     }
 
-    // 5. Otherwise check for Apple Wallet / Octopus App multi-line layout
     const amtMatch = line.match(/([+-]?)\s*(?:HKD|HK\$|\$)\s*([0-9,]+\.[0-9]{1,2})/i);
     if (!amtMatch) continue;
 
     const sign = amtMatch[1];
     if (sign === "+") {
-      // Top-up -> skip
       pendingTimestampLabel = null;
       continue;
     }
@@ -686,7 +1097,6 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       .replace(/^[.\s-–—:]+|[.\s]+$/g, "")
       .trim();
 
-    // Separate any embedded date/timestamp from prefix & suffix so a date/time NEVER becomes the merchant name!
     const prefixSplit = splitDateFromText(rawPrefix);
     const suffixSplit = splitDateFromText(rawSuffix);
 
@@ -707,7 +1117,6 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       }
     }
 
-    // Look 1-3 lines backward if title or dayLabel is still missing
     for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
       const prevLine = rawLines[j];
       if (isBalanceLine(prevLine) || noise.test(prevLine)) continue;
@@ -727,7 +1136,6 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       }
     }
 
-    // Look 1-2 lines ahead if subtitle or dayLabel is still missing
     for (let j = i + 1; j <= Math.min(rawLines.length - 1, i + 2); j++) {
       const nextLine = rawLines[j];
       if (isBalanceLine(nextLine) || noise.test(nextLine)) continue;
@@ -789,16 +1197,40 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
 }
 
 /**
- * Parses multi-line text (from Notification Center, Apple Wallet history screenshots, or batch paste).
+ * Master multi-line parser for:
+ *  - Gmail App popup banners, Gmail inbox list screenshots, and opened PayMe emails
+ *  - Hang Seng Bank App history screenshots ("CUP KPAY*KITSUNE 14OCT HKD 614.00 -614.00 HKD")
+ *  - PayMe App history screenshots ("Claudia Yue - 800.00 / $70/hr")
+ *  - Apple Wallet / Octopus Lock Screen & history screenshots
  */
 export function parseMultipleNotifications(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
 
+  // 1. Check PayMe email / Gmail App banners, inbox list, or opened emails first (supports multiple emails on screen)
+  const paymeEmails = parsePayMeEmailNotifications(text, refDate);
+  if (paymeEmails.length > 0) {
+    return paymeEmails;
+  }
+
+  // 2. Check Hang Seng Bank App history screenshot
+  const hangSengItems = parseHangSengHistoryList(text, refDate);
+  if (hangSengItems.length > 0) {
+    return hangSengItems;
+  }
+
+  // 3. Check PayMe App history screenshot
+  const paymeAppItems = parsePayMeAppHistoryList(text, refDate);
+  if (paymeAppItems.length > 0) {
+    return paymeAppItems;
+  }
+
+  // 4. Check Apple Wallet / Lock Screen Octopus history list
   const historyItems = parseWalletHistoryList(text, refDate);
   if (historyItems.length > 0) {
     return historyItems;
   }
 
+  // 5. Fallback to line-by-line single notification parsing
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())
