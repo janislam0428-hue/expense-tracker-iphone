@@ -2,8 +2,8 @@ import type { Db } from "@/lib/db-client";
 import { decideReview } from "@/lib/review/rules";
 import { shortHash } from "@/lib/text";
 import { formatMoney } from "@/lib/money";
-import { formatInZone } from "@/lib/time";
-import { parseNotification, type ParsedNotification } from "./notification";
+import { dayStart, formatInZone } from "@/lib/time";
+import { isBalanceLine, isTopUpLine, parseNotification, type ParsedNotification } from "./notification";
 import type { Channel } from "@/lib/domain";
 import { classifyMerchant } from "@/lib/reference/classify";
 
@@ -20,7 +20,8 @@ export type IngestResult = {
 
 /**
  * Ingests a notification record into the Tally database.
- * Detects duplicates, applies categorization rules, and assigns review status.
+ * Detects duplicates by timestamp + payment source + amount (and balance/merchant),
+ * ignores top-ups and remaining balances, and applies categorization rules.
  */
 export async function ingestNotificationRecord(
   db: Db,
@@ -37,7 +38,16 @@ export async function ingestNotificationRecord(
   if (!parsed) {
     return {
       ok: false,
-      message: "No transaction details found in text. Check format.",
+      message: "No expense transaction found in text.",
+    };
+  }
+
+  // Never import top-ups or balance lines so totals are never doubled
+  if (parsed.type === "top_up" || isTopUpLine(parsed.merchant) || isBalanceLine(parsed.merchant)) {
+    return {
+      ok: true,
+      isDuplicate: true,
+      message: "Skipped top-up or balance line.",
     };
   }
 
@@ -48,10 +58,7 @@ export async function ingestNotificationRecord(
   // 1. Resolve payment source
   let source = await db.paymentSource.findFirst({
     where: {
-      OR: [
-        { name: parsed.sourceName },
-        { kind: parsed.sourceKind },
-      ],
+      OR: [{ name: parsed.sourceName }, { kind: parsed.sourceKind }],
     },
   });
 
@@ -68,74 +75,43 @@ export async function ingestNotificationRecord(
     });
   }
 
-  // 2. Check for matching MerchantRule (auto-categorization without AI cost)
-  const rules = await db.merchantRule.findMany({
-    orderBy: { hits: "desc" },
-    include: { category: true, purpose: true },
-  });
-
-  const matchedRule = rules.find((r) =>
-    parsed.merchantNormalized.includes(r.pattern.toLowerCase().trim()),
-  );
-
-  // A remembered rule may point to a child category; expand it into the pair.
-  let categoryId: string | null = matchedRule?.category?.parentId ?? matchedRule?.categoryId ?? null;
-  let subcategoryId: string | null = matchedRule?.category?.parentId ? matchedRule.categoryId : null;
-  let purposeId: string | null = matchedRule?.purposeId ?? null;
-
-  const hint = classifyMerchant(parsed.merchantNormalized);
-  // If no rule matched, attempt keyword category match
-  if (!categoryId) {
-    const categories = await db.category.findMany({ where: { archived: false } });
-    if (parsed.type === "top_up") {
-      const topUpCat = categories.find((c) => c.name === "Top ups & Transfers");
-      if (topUpCat) categoryId = topUpCat.id;
-    } else if (parsed.isPersonToPerson) {
-      const transferCat = categories.find(
-        (c) => c.name === (parsed.type === "income" ? "Money Received" : "Transfers to People"),
-      );
-      if (transferCat) categoryId = transferCat.id;
-    } else {
-      const parent = hint && categories.find((c) => c.name === hint.category && !c.parentId);
-      if (parent) categoryId = parent.id;
-    }
-  }
-
-  const category = categoryId
-    ? await db.category.findUnique({ where: { id: categoryId } })
-    : null;
-
-  // Fill a subcategory only when the hint agrees with the chosen category.
-  if (!subcategoryId && hint?.category === category?.name && hint?.subcategory) {
-    const child = await db.category.findFirst({
-      where: { parentId: categoryId, name: hint.subcategory, archived: false },
-    });
-    subcategoryId = child?.id ?? null;
-  }
-
-  // 3. Decide review status (a saved merchant rule with a category or purpose skips review)
-  const review = decideReview({
-    amountMinor: parsed.amountMinor,
-    type: parsed.type,
-    categoryAmbiguous: category ? category.ambiguous : null,
-    hasRulePurpose: !!(matchedRule?.categoryId || matchedRule?.purposeId),
-    isPersonToPerson: parsed.isPersonToPerson,
-    reviewThresholdMinor: settings.reviewThresholdMinor,
-  });
-
-  // 4. Deterministic fingerprint for duplicate detection
+  // 2. Strict Duplicate Detection:
+  //    Prevent duplicates when uploading the same screenshot or notification more than once.
   const dayStr = formatInZone(occurredAt, "yyyy-MM-dd", settings.timezone);
-  const fingerprint = `auto:${shortHash(`${source.name}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}|${parsed.location ?? ""}|${parsed.balanceAfterMinor ?? ""}`)}`;
+  const minuteStr = formatInZone(occurredAt, "yyyy-MM-dd'T'HH:mm", settings.timezone);
+  const fingerprint = `auto:${shortHash(`${source.id}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}|${parsed.balanceAfterMinor ?? ""}`)}`;
 
-  // Look for duplicate on the same day from previous import batches
-  const windowStart = new Date(occurredAt.getTime() - 24 * 3600 * 1000);
-  const windowEnd = new Date(occurredAt.getTime() + 24 * 3600 * 1000);
+  const startOfDay = dayStart(occurredAt, settings.timezone);
+  const endOfDay = new Date(startOfDay.getTime() + 86_400_000);
+  const minuteStart = new Date(Math.floor(occurredAt.getTime() / 60_000) * 60_000);
+  const minuteEnd = new Date(minuteStart.getTime() + 59_999);
 
   const existing = await db.transaction.findFirst({
     where: {
-      fingerprint,
-      occurredAt: { gte: windowStart, lte: windowEnd },
-      ...(input.batchId ? { NOT: { importBatchId: input.batchId } } : {}),
+      sourceId: source.id,
+      amountMinor: parsed.amountMinor,
+      isDemo: false,
+      OR: [
+        // A. Exact same payment source + same minute timestamp + same amount
+        {
+          occurredAt: { gte: minuteStart, lte: minuteEnd },
+        },
+        // B. Same payment source + same day + same amount + same remaining balance
+        ...(parsed.balanceAfterMinor !== undefined
+          ? [
+              {
+                occurredAt: { gte: startOfDay, lt: endOfDay },
+                balanceAfterMinor: parsed.balanceAfterMinor,
+              },
+            ]
+          : []),
+        // C. Same deterministic fingerprint on the same day across uploads
+        {
+          fingerprint,
+          occurredAt: { gte: startOfDay, lt: endOfDay },
+          ...(input.batchId ? { NOT: { importBatchId: input.batchId } } : {}),
+        },
+      ],
     },
   });
 
@@ -146,9 +122,56 @@ export async function ingestNotificationRecord(
       transactionId: existing.id,
       merchant: existing.merchant,
       amountFormatted: formatMoney(existing.amountMinor, settings.currency),
-      message: `Duplicate skipped: ${formatMoney(existing.amountMinor, settings.currency)} at ${existing.merchant} was already recorded.`,
+      message: `Duplicate skipped (${minuteStr}): ${formatMoney(existing.amountMinor, settings.currency)} at ${existing.merchant} was already recorded.`,
     };
   }
+
+  // 3. Check for matching MerchantRule (auto-categorization without AI cost)
+  const rules = await db.merchantRule.findMany({
+    orderBy: { hits: "desc" },
+    include: { category: true, purpose: true },
+  });
+
+  const matchedRule = rules.find((r) =>
+    parsed.merchantNormalized.includes(r.pattern.toLowerCase().trim()),
+  );
+
+  let categoryId: string | null = matchedRule?.category?.parentId ?? matchedRule?.categoryId ?? null;
+  let subcategoryId: string | null = matchedRule?.category?.parentId ? matchedRule.categoryId : null;
+  const purposeId: string | null = matchedRule?.purposeId ?? null;
+
+  const hint = classifyMerchant(parsed.merchantNormalized);
+  if (!categoryId) {
+    const categories = await db.category.findMany({ where: { archived: false } });
+    if (parsed.isPersonToPerson) {
+      const transferCat = categories.find(
+        (c) => c.name === (parsed.type === "income" ? "Money Received" : "Transfers to People"),
+      );
+      if (transferCat) categoryId = transferCat.id;
+    } else {
+      const parent = hint && categories.find((c) => c.name === hint.category && !c.parentId);
+      if (parent) categoryId = parent.id;
+    }
+  }
+
+  const category = categoryId ? await db.category.findUnique({ where: { id: categoryId } }) : null;
+
+  if (!subcategoryId && hint?.category === category?.name && hint?.subcategory) {
+    const child = await db.category.findFirst({
+      where: { parentId: categoryId, name: hint.subcategory, archived: false },
+    });
+    subcategoryId = child?.id ?? null;
+  }
+
+  // 4. Decide review status
+  const review = decideReview({
+    amountMinor: parsed.amountMinor,
+    type: parsed.type,
+    categoryAmbiguous: category ? category.ambiguous : null,
+    hasRulePurpose: !!(matchedRule?.categoryId || matchedRule?.purposeId),
+    isPersonToPerson: parsed.isPersonToPerson,
+    reviewThresholdMinor: settings.reviewThresholdMinor,
+  });
 
   // 5. Ensure batch exists
   let batchId = input.batchId;
@@ -194,7 +217,6 @@ export async function ingestNotificationRecord(
     },
   });
 
-  // Update rule stats if matched
   if (matchedRule) {
     await db.merchantRule.update({
       where: { id: matchedRule.id },
@@ -202,7 +224,6 @@ export async function ingestNotificationRecord(
     });
   }
 
-  // Save raw capture text
   if (parsed.rawText) {
     await db.rawCapture.create({
       data: {
@@ -215,7 +236,6 @@ export async function ingestNotificationRecord(
     });
   }
 
-  // Update last import time in settings
   await db.settings.update({
     where: { id: 1 },
     data: { lastImportAt: new Date() },

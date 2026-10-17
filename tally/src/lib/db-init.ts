@@ -5,6 +5,8 @@ import { cleanEnv } from "./db-client";
 import { ensureReferenceData } from "./reference/ensure";
 import { LEGACY_CATEGORIES, migrateTaxonomy } from "./reference/migrate-taxonomy";
 import { loadDemoData } from "./demo/apply";
+import { isBalanceLine, isDateOrTimestampLabel, isTopUpLine, resolveRelativeDay } from "./parsers/notification";
+import { normalizeMerchant } from "./text";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS "Transaction" (
@@ -174,25 +176,66 @@ CREATE UNIQUE INDEX IF NOT EXISTS "Budget_categoryId_period_key" ON "Budget"("ca
 
 const globalForInit = globalThis as unknown as { __tallyDbReady?: Promise<void> };
 
-async function cleanupMisdetectedBalanceRows(): Promise<void> {
+/**
+ * Repairs and deduplicates existing non-demo rows from earlier screenshots:
+ * 1. Deletes any balance-statement or top-up rows (both pending and confirmed).
+ * 2. If a transaction's merchant name is actually a timestamp/date (e.g. "Thu 18:56", "Wed 22:34", "1h ago", "2026-10-07"),
+ *    moves that timestamp into occurredAt and renames merchant to its subcategory ("Public transport") or "Octopus".
+ * 3. Deduplicates transactions with the exact same sourceId, amountMinor, and minute timestamp.
+ */
+async function cleanupAndRepairExistingRows(): Promise<void> {
   try {
-    const candidates = await db.transaction.findMany({
-      where: { isDemo: false, purposeStatus: "needs_review" },
-      select: { id: true, merchant: true },
+    const rows = await db.transaction.findMany({
+      where: { isDemo: false },
+      include: { category: true, subcategory: true },
+      orderBy: { createdAt: "asc" },
     });
-    const badIds = candidates
-      .filter(
-        (c) =>
-          /\b(?:new balance|remaining balance|balance is)\b/i.test(c.merchant) ||
-          /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+)?\d{1,2}:\d{2}$/i.test(c.merchant.trim()) ||
-          /^\d+\s*[hm]\s*ago$/i.test(c.merchant.trim()),
-      )
-      .map((c) => c.id);
-    if (badIds.length > 0) {
-      await db.transaction.deleteMany({ where: { id: { in: badIds } } });
+
+    const toDeleteIds: string[] = [];
+    const seenKey = new Set<string>();
+
+    for (const r of rows) {
+      // 1. Remove balance lines and top-ups
+      if (r.type === "top_up" || isBalanceLine(r.merchant) || isTopUpLine(r.merchant)) {
+        toDeleteIds.push(r.id);
+        continue;
+      }
+
+      let effectiveOccurredAt = r.occurredAt;
+      let effectiveMerchant = r.merchant;
+
+      // 2. If merchant is a timestamp/date label (like "Thu 18:56", "Wed 22:34", "1h ago", "2026-10-07"), repair it!
+      if (isDateOrTimestampLabel(r.merchant)) {
+        const resolved = resolveRelativeDay(r.merchant, r.occurredAt);
+        effectiveOccurredAt = resolved.date;
+        effectiveMerchant = r.subcategory?.name || (r.category?.name === "Transport" ? "Bus" : "Octopus");
+
+        await db.transaction.update({
+          where: { id: r.id },
+          data: {
+            occurredAt: effectiveOccurredAt,
+            datePrecision: resolved.precision,
+            merchant: effectiveMerchant,
+            merchantNormalized: normalizeMerchant(effectiveMerchant),
+          },
+        });
+      }
+
+      // 3. Deduplicate by same sourceId + same minute + same amount
+      const minuteBucket = Math.floor(effectiveOccurredAt.getTime() / 60_000);
+      const dedupKey = `${r.sourceId}|${minuteBucket}|${r.amountMinor}`;
+      if (seenKey.has(dedupKey)) {
+        toDeleteIds.push(r.id);
+      } else {
+        seenKey.add(dedupKey);
+      }
     }
-  } catch {
-    // Non-fatal cleanup
+
+    if (toDeleteIds.length > 0) {
+      await db.transaction.deleteMany({ where: { id: { in: toDeleteIds } } });
+    }
+  } catch (err) {
+    console.error("Cleanup/repair non-fatal error:", err);
   }
 }
 
@@ -201,7 +244,6 @@ async function runInit(): Promise<void> {
   try {
     existing = await db.settings.findUnique({ where: { id: 1 } });
   } catch {
-    // Table does not exist yet — create schema via libSQL client
     const url = cleanEnv(process.env.DATABASE_URL) ?? "file:./data/tally.db";
     const authToken = cleanEnv(process.env.DATABASE_AUTH_TOKEN);
     const client = createClient({ url, authToken });
@@ -209,10 +251,8 @@ async function runInit(): Promise<void> {
   }
 
   if (existing) {
-    // Clean up any misdetected balance/timestamp rows from earlier screenshots
-    await cleanupMisdetectedBalanceRows();
+    await cleanupAndRepairExistingRows();
 
-    // Check if the 9-category taxonomy migration still needs to be applied
     const [legacyFound, newFoodFound] = await Promise.all([
       db.category.findFirst({
         where: {
@@ -244,7 +284,7 @@ async function runInit(): Promise<void> {
 }
 
 /**
- * Automatically creates tables, reference data, and applies taxonomy migrations
+ * Automatically creates tables, reference data, repairs misdetected rows, and applies taxonomy migrations
  * on first run so the user never has to manually execute CLI commands on Turso.
  */
 export async function ensureDatabaseInitialized(): Promise<void> {
