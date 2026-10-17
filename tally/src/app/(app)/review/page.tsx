@@ -11,13 +11,18 @@ export default async function ReviewPage() {
   await requireAuth();
   const settings = await getSettings();
 
-  const [rows, purposes] = await Promise.all([
+  const [rows, purposes, categories] = await Promise.all([
     db.transaction.findMany({
       where: { ...demoScope(settings), purposeStatus: "needs_review", duplicateOfId: null },
       orderBy: { occurredAt: "desc" },
       include: { category: true, subcategory: true, source: true, purpose: true },
     }),
     db.purpose.findMany({ orderBy: { sortOrder: "asc" } }),
+    db.category.findMany({
+      where: { parentId: null, archived: false },
+      orderBy: { sortOrder: "asc" },
+      include: { children: { where: { archived: false }, orderBy: { sortOrder: "asc" } } },
+    }),
   ]);
 
   return (
@@ -28,6 +33,10 @@ export default async function ReviewPage() {
       />
       <ReviewInbox
         initialTransactions={rows}
+        categories={categories.map((c) => ({
+          id: c.id, name: c.name,
+          children: c.children.map((s) => ({ id: s.id, name: s.name })),
+        }))}
         purposes={purposes.map((p) => ({
           id: p.id,
           name: p.name,
