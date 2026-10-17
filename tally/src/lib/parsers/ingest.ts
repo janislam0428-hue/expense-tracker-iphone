@@ -93,17 +93,39 @@ export async function ingestNotificationRecord(
       );
       if (transferCat) categoryId = transferCat.id;
     } else {
-      // Heuristic match for prominent categories
       const m = parsed.merchantNormalized;
-      if (/bus|kmb|mtr|citybus|transit|train|minibus|ferry|tram|taxi/i.test(m)) {
-        const transCat = categories.find((c) => c.name === "Transport");
-        if (transCat) categoryId = transCat.id;
+      if (/bus|kmb|mtr|citybus|transit|train|minibus|ferry|tram|taxi|九巴|港鐵|巴士|小巴|電車|渡輪/i.test(m)) {
+        const transCat = categories.find((c) => c.name === "Transport" && !c.parentId);
+        if (transCat) {
+          categoryId = transCat.id;
+          // Auto-assign Personal purpose for transit
+          if (!purposeId) {
+            const personal = await db.purpose.findFirst({ where: { name: "Personal" } });
+            if (personal) purposeId = personal.id;
+          }
+          // Match subcategory (Bus, MTR, etc.)
+          const subName = /train|mtr|transit|港鐵/i.test(m)
+            ? "MTR"
+            : /bus|kmb|citybus|九巴|巴士/i.test(m)
+              ? "Bus"
+              : /minibus|小巴/i.test(m)
+                ? "Minibus"
+                : null;
+          if (subName) {
+            const subCat = categories.find((c) => c.parentId === transCat.id && c.name === subName);
+            if (subCat) subcategoryId = subCat.id;
+          }
+        }
       } else if (/starbucks|coffee|cafe|mcdonald|restaurant|tsui wah|tamjai|din tai fung/i.test(m)) {
-        const dinCat = categories.find((c) => c.name === "Dining");
+        const dinCat = categories.find((c) => c.name === "Dining" && !c.parentId);
         if (dinCat) categoryId = dinCat.id;
       } else if (/parknshop|wellcome|7 eleven|circle k|market|supermarket/i.test(m)) {
-        const grocCat = categories.find((c) => c.name === "Groceries");
+        const grocCat = categories.find((c) => c.name === "Groceries" && !c.parentId);
         if (grocCat) categoryId = grocCat.id;
+      } else if (/^purchase$/i.test(m)) {
+        // Generic Octopus retail "Purchase" from Apple Wallet -> Other (ambiguous so user can confirm)
+        const otherCat = categories.find((c) => c.name === "Other" && !c.parentId);
+        if (otherCat) categoryId = otherCat.id;
       }
     }
   }
@@ -124,16 +146,17 @@ export async function ingestNotificationRecord(
 
   // 4. Deterministic fingerprint for duplicate detection
   const dayStr = formatInZone(occurredAt, "yyyy-MM-dd", settings.timezone);
-  const fingerprint = `auto:${shortHash(`${source.name}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}`)}`;
+  const fingerprint = `auto:${shortHash(`${source.name}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}|${parsed.location ?? ""}`)}`;
 
-  // Look for duplicate within ±36 hours
-  const windowStart = new Date(occurredAt.getTime() - 36 * 3600 * 1000);
-  const windowEnd = new Date(occurredAt.getTime() + 36 * 3600 * 1000);
+  // Look for duplicate on the same day from previous import batches
+  const windowStart = new Date(occurredAt.getTime() - 24 * 3600 * 1000);
+  const windowEnd = new Date(occurredAt.getTime() + 24 * 3600 * 1000);
 
   const existing = await db.transaction.findFirst({
     where: {
       fingerprint,
       occurredAt: { gte: windowStart, lte: windowEnd },
+      ...(input.batchId ? { NOT: { importBatchId: input.batchId } } : {}),
     },
   });
 
