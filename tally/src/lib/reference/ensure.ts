@@ -2,7 +2,7 @@ import type { Db } from "@/lib/db-client";
 import { CATEGORY_SEEDS, PURPOSE_SEEDS, SOURCE_SEEDS } from "./catalog";
 
 /** Creates settings, categories, purposes and sources if they are missing. Safe to run repeatedly. */
-export async function ensureReferenceData(db: Db) {
+export async function ensureReferenceData(db: Pick<Db, "settings" | "category" | "purpose" | "paymentSource">) {
   await db.settings.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } });
 
   let order = 0;
