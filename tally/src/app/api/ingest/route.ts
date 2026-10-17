@@ -80,35 +80,44 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2. Direct structured fields support (e.g. from Apple Wallet automation)
+    // 2. Direct structured fields support (e.g. from Apple Wallet automation, even if Merchant is omitted by iOS)
     if (payloadJson) {
       const directAmount = payloadJson.Amount ?? payloadJson.amount ?? payloadJson.value;
-      const directMerchant = payloadJson.Merchant ?? payloadJson.merchant ?? payloadJson.payee;
+      const directMerchant = payloadJson.Merchant ?? payloadJson.merchant ?? payloadJson.payee ?? payloadJson.name;
+      const directCard = payloadJson.Card ?? payloadJson.card ?? payloadJson.source ?? payloadJson.pass;
 
-      if (directAmount !== undefined && directMerchant !== undefined) {
-        const amountMinor = Math.round(parseFloat(String(directAmount).replace(/[^0-9.]/g, "")) * 100);
-        const merchant = String(directMerchant).trim();
-        const cardName = String(payloadJson.Card ?? payloadJson.card ?? payloadJson.source ?? "Octopus").trim();
-        const isOctopus = cardName.toLowerCase().includes("octopus");
+      if (directAmount !== undefined && String(directAmount).trim() !== "") {
+        const numericAmount = parseFloat(String(directAmount).replace(/[^0-9.]/g, ""));
+        if (!Number.isNaN(numericAmount) && numericAmount > 0) {
+          const amountMinor = Math.round(numericAmount * 100);
+          const cardName = String(directCard || "Octopus").trim() || "Octopus";
+          const isOctopus = cardName.toLowerCase().includes("octopus") || cardName.includes("八達通");
+          const merchant =
+            directMerchant && String(directMerchant).trim() !== ""
+              ? String(directMerchant).trim()
+              : isOctopus
+                ? "Octopus Purchase"
+                : `${cardName} Purchase`;
 
-        const result = await ingestNotificationRecord(db, {
-          parsed: {
-            amountMinor,
-            currency: String(payloadJson.Currency ?? payloadJson.currency ?? "HKD"),
-            merchant,
-            merchantNormalized: normalizeMerchant(merchant),
-            type: "expense",
-            sourceName: isOctopus ? "Octopus" : cardName,
-            sourceKind: isOctopus ? "octopus" : "credit_card",
-            datePrecision: "minute",
-            isPersonToPerson: false,
-            confidence: 1.0,
-            rawText: JSON.stringify(payloadJson),
-          },
-          channel: "shortcut",
-        });
+          const result = await ingestNotificationRecord(db, {
+            parsed: {
+              amountMinor,
+              currency: String(payloadJson.Currency ?? payloadJson.currency ?? "HKD"),
+              merchant,
+              merchantNormalized: normalizeMerchant(merchant),
+              type: "expense",
+              sourceName: isOctopus ? "Octopus" : cardName,
+              sourceKind: isOctopus ? "octopus" : "credit_card",
+              datePrecision: "minute",
+              isPersonToPerson: false,
+              confidence: 1.0,
+              rawText: JSON.stringify(payloadJson),
+            },
+            channel: "shortcut",
+          });
 
-        return NextResponse.json(result);
+          return NextResponse.json(result);
+        }
       }
 
       if (typeof payloadJson.text === "string") {

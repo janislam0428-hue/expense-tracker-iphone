@@ -1,14 +1,15 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { Plus, Search, Trash2, X } from "lucide-react";
+import { Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { TxListHeader, TxRow, type TxRowData } from "@/components/app/tx-row";
-import { addTransaction, deleteTransaction } from "./actions";
+import { formatInZone } from "@/lib/time";
+import { addTransaction, updateTransaction, deleteTransaction } from "./actions";
 
 type Option = { id: string; name: string };
 type CategoryOption = { id: string; name: string; children?: Option[] };
@@ -32,6 +33,8 @@ export function TransactionsView({
   const [selectedCat, setSelectedCat] = useState<string>("all");
   const [selectedSource, setSelectedSource] = useState<string>("all");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [editingTx, setEditingTx] = useState<TxRowData | null>(null);
+
   const [modalCategoryId, setModalCategoryId] = useState<string>(categories[0]?.id ?? "");
   const [modalSubcategoryId, setModalSubcategoryId] = useState<string>("none");
   const [pending, startTransition] = useTransition();
@@ -39,13 +42,26 @@ export function TransactionsView({
   const activeModalCategory = categories.find((c) => c.id === modalCategoryId);
   const modalSubcategories = activeModalCategory?.children ?? [];
 
+  const openAddModal = () => {
+    setModalCategoryId(categories[0]?.id ?? "");
+    setModalSubcategoryId("none");
+    setIsAddOpen(true);
+  };
+
+  const openEditModal = (tx: TxRowData) => {
+    setModalCategoryId(tx.categoryId ?? "none");
+    setModalSubcategoryId(tx.subcategoryId ?? "none");
+    setEditingTx(tx);
+  };
+
   const filtered = transactions.filter((t) => {
     if (search.trim()) {
       const q = search.toLowerCase();
       const matchMerchant = t.merchant.toLowerCase().includes(q);
       const matchDesc = t.description?.toLowerCase().includes(q) ?? false;
+      const matchNotes = t.notes?.toLowerCase().includes(q) ?? false;
       const matchSub = t.subcategory?.name.toLowerCase().includes(q) ?? false;
-      if (!matchMerchant && !matchDesc && !matchSub) return false;
+      if (!matchMerchant && !matchDesc && !matchNotes && !matchSub) return false;
     }
     if (selectedCat !== "all") {
       if (t.category?.name !== selectedCat) return false;
@@ -128,7 +144,7 @@ export function TransactionsView({
           )}
         </div>
 
-        <Button onClick={() => setIsAddOpen(true)} className="h-9 gap-1.5 shrink-0">
+        <Button onClick={openAddModal} className="h-9 gap-1.5 shrink-0">
           <Plus className="size-4" />
           Add transaction
         </Button>
@@ -151,6 +167,11 @@ export function TransactionsView({
 
             <form
               action={async (formData) => {
+                if (modalCategoryId && modalCategoryId !== "none") {
+                  formData.set("categoryId", modalCategoryId);
+                } else {
+                  formData.delete("categoryId");
+                }
                 if (modalSubcategoryId && modalSubcategoryId !== "none") {
                   formData.set("subcategoryId", modalSubcategoryId);
                 } else {
@@ -200,6 +221,18 @@ export function TransactionsView({
                 </div>
               </div>
 
+              <div className="grid gap-1">
+                <Label htmlFor="occurredAt" className="text-[13px]">
+                  Date &amp; Time
+                </Label>
+                <Input
+                  id="occurredAt"
+                  name="occurredAt"
+                  type="datetime-local"
+                  defaultValue={formatInZone(new Date(), "yyyy-MM-dd'T'HH:mm", zone)}
+                />
+              </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div className="grid gap-1">
                   <Label htmlFor="sourceId" className="text-[13px]">
@@ -224,7 +257,6 @@ export function TransactionsView({
                     Category
                   </Label>
                   <Select
-                    name="categoryId"
                     value={modalCategoryId}
                     onValueChange={(val) => {
                       setModalCategoryId(val);
@@ -235,6 +267,7 @@ export function TransactionsView({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="none">Uncategorised</SelectItem>
                       {categories.map((c) => (
                         <SelectItem key={c.id} value={c.id}>
                           {c.name}
@@ -268,7 +301,7 @@ export function TransactionsView({
 
               <div className="grid gap-1">
                 <Label htmlFor="notes" className="text-[13px]">
-                  Notes (optional)
+                  Details / Notes (optional)
                 </Label>
                 <Input id="notes" name="notes" placeholder="e.g. Lunch with colleagues" />
               </div>
@@ -284,9 +317,216 @@ export function TransactionsView({
         </div>
       )}
 
+      {/* Edit Transaction Modal */}
+      {editingTx && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-[420px] rounded-xl border border-border bg-background p-5 shadow-xl animate-in fade-in-50 zoom-in-95">
+            <div className="flex items-center justify-between pb-3 border-b border-border">
+              <h3 className="text-[16px] font-semibold">Edit Transaction</h3>
+              <button
+                type="button"
+                onClick={() => setEditingTx(null)}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                <X className="size-5" />
+              </button>
+            </div>
+
+            <form
+              action={async (formData) => {
+                formData.set("id", editingTx.id);
+                if (modalCategoryId && modalCategoryId !== "none") {
+                  formData.set("categoryId", modalCategoryId);
+                } else {
+                  formData.delete("categoryId");
+                }
+                if (modalSubcategoryId && modalSubcategoryId !== "none") {
+                  formData.set("subcategoryId", modalSubcategoryId);
+                } else {
+                  formData.delete("subcategoryId");
+                }
+                const res = await updateTransaction(undefined, formData);
+                if (res?.ok) {
+                  toast.success(res.ok);
+                  setEditingTx(null);
+                  window.location.reload();
+                } else if (res?.error) {
+                  toast.error(res.error);
+                }
+              }}
+              className="mt-4 flex flex-col gap-3.5"
+            >
+              <div className="grid gap-1">
+                <Label htmlFor="edit-merchant" className="text-[13px]">
+                  Merchant / Name *
+                </Label>
+                <Input
+                  id="edit-merchant"
+                  name="merchant"
+                  required
+                  defaultValue={editingTx.merchant}
+                  placeholder="e.g. Starbucks, Bus, MTR"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-amount" className="text-[13px]">
+                    Amount ({currency}) *
+                  </Label>
+                  <Input
+                    id="edit-amount"
+                    name="amount"
+                    required
+                    inputMode="decimal"
+                    defaultValue={(editingTx.amountMinor / 100).toFixed(2)}
+                  />
+                </div>
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-type" className="text-[13px]">
+                    Type
+                  </Label>
+                  <Select name="type" defaultValue={editingTx.type}>
+                    <SelectTrigger id="edit-type" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="expense">Expense</SelectItem>
+                      <SelectItem value="income">Income</SelectItem>
+                      <SelectItem value="top_up">Top up</SelectItem>
+                      <SelectItem value="refund">Refund</SelectItem>
+                      <SelectItem value="transfer">Transfer</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div className="grid gap-1">
+                <Label htmlFor="edit-occurredAt" className="text-[13px]">
+                  Date &amp; Time
+                </Label>
+                <Input
+                  id="edit-occurredAt"
+                  name="occurredAt"
+                  type="datetime-local"
+                  defaultValue={formatInZone(editingTx.occurredAt, "yyyy-MM-dd'T'HH:mm", zone)}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-sourceId" className="text-[13px]">
+                    Payment Source *
+                  </Label>
+                  <Select
+                    name="sourceId"
+                    defaultValue={
+                      editingTx.sourceId ??
+                      sources.find((s) => s.name === editingTx.source.name)?.id ??
+                      sources[0]?.id
+                    }
+                  >
+                    <SelectTrigger id="edit-sourceId" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {sources.map((s) => (
+                        <SelectItem key={s.id} value={s.id}>
+                          {s.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-categoryId" className="text-[13px]">
+                    Category
+                  </Label>
+                  <Select
+                    value={modalCategoryId}
+                    onValueChange={(val) => {
+                      setModalCategoryId(val);
+                      setModalSubcategoryId("none");
+                    }}
+                  >
+                    <SelectTrigger id="edit-categoryId" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">Uncategorised</SelectItem>
+                      {categories.map((c) => (
+                        <SelectItem key={c.id} value={c.id}>
+                          {c.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              {modalSubcategories.length > 0 && (
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-subcategoryId" className="text-[13px]">
+                    Subcategory (optional)
+                  </Label>
+                  <Select value={modalSubcategoryId} onValueChange={setModalSubcategoryId}>
+                    <SelectTrigger id="edit-subcategoryId" className="w-full">
+                      <SelectValue placeholder="Not specified" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">Not specified</SelectItem>
+                      {modalSubcategories.map((sub) => (
+                        <SelectItem key={sub.id} value={sub.id}>
+                          {sub.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              <div className="grid gap-1">
+                <Label htmlFor="edit-notes" className="text-[13px]">
+                  Details / Notes (optional)
+                </Label>
+                <Input
+                  id="edit-notes"
+                  name="notes"
+                  defaultValue={[editingTx.description, editingTx.notes].filter(Boolean).join(" · ")}
+                  placeholder="Optional detail or note"
+                />
+              </div>
+
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    const target = editingTx;
+                    setEditingTx(null);
+                    handleDelete(target.id, target.merchant);
+                  }}
+                  className="gap-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                >
+                  <Trash2 className="size-4" />
+                  Delete
+                </Button>
+                <div className="flex gap-2">
+                  <Button type="button" variant="outline" onClick={() => setEditingTx(null)}>
+                    Cancel
+                  </Button>
+                  <Button type="submit">Save Changes</Button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Transaction List */}
       <div>
-        <TxListHeader />
+        <TxListHeader showActions />
         {filtered.length === 0 ? (
           <div className="py-12 text-center text-sm text-muted-foreground">
             No transactions match your search or filter.
@@ -294,18 +534,33 @@ export function TransactionsView({
         ) : (
           <ul className="divide-y divide-border">
             {filtered.map((t) => (
-              <div key={t.id} className="group relative">
-                <TxRow tx={t} zone={zone} />
-                <button
-                  type="button"
-                  title="Delete"
-                  disabled={pending}
-                  onClick={() => handleDelete(t.id, t.merchant)}
-                  className="absolute right-2 top-2 hidden size-7 place-items-center rounded bg-background/80 text-muted-foreground hover:text-destructive group-hover:grid sm:top-1.5"
-                >
-                  <Trash2 className="size-3.5" />
-                </button>
-              </div>
+              <TxRow
+                key={t.id}
+                tx={t}
+                zone={zone}
+                actions={
+                  <>
+                    <button
+                      type="button"
+                      title="Edit transaction"
+                      disabled={pending}
+                      onClick={() => openEditModal(t)}
+                      className="grid size-8 place-items-center rounded-md border border-border/60 bg-background text-muted-foreground hover:text-foreground"
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      title="Delete transaction"
+                      disabled={pending}
+                      onClick={() => handleDelete(t.id, t.merchant)}
+                      className="grid size-8 place-items-center rounded-md border border-border/60 bg-background text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  </>
+                }
+              />
             ))}
           </ul>
         )}

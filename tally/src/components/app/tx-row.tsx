@@ -13,8 +13,12 @@ export type TxRowData = {
   merchant: string;
   description: string | null;
   location: string | null;
+  notes?: string | null;
   type: string;
   purposeStatus: string;
+  categoryId?: string | null;
+  subcategoryId?: string | null;
+  sourceId?: string;
   category: { name: string; color: string } | null;
   subcategory: { name: string } | null;
   source: { name: string };
@@ -26,31 +30,46 @@ export function formatTxDate(d: Date, precision: string, zone: string) {
 }
 
 /** One transaction as a Notion database style row. Stacks on phones. */
-export function TxRow({ tx, zone, footer }: { tx: TxRowData; zone: string; footer?: React.ReactNode }) {
+export function TxRow({
+  tx,
+  zone,
+  footer,
+  actions,
+}: {
+  tx: TxRowData;
+  zone: string;
+  footer?: React.ReactNode;
+  actions?: React.ReactNode;
+}) {
   const sub =
     tx.subcategory?.name && tx.subcategory.name.toLowerCase() !== tx.merchant.toLowerCase()
       ? tx.subcategory.name
       : null;
-  const detail = [sub, tx.location, tx.description].filter(Boolean).join(" · ");
+  const detail = [sub, tx.location, tx.description, tx.notes].filter(Boolean).join(" · ");
   const isNonSpend = tx.type !== "expense";
   return (
-    <li className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 px-3 py-2.5 sm:grid-cols-[112px_minmax(0,1fr)_minmax(0,170px)_minmax(0,140px)_110px] sm:py-2">
-      <div className="order-3 col-span-2 text-[12.5px] text-muted-foreground sm:order-none sm:col-span-1">
-        {formatTxDate(tx.occurredAt, tx.datePrecision, zone)}
-        <span className="sm:hidden"> · {tx.source.name}</span>
+    <li className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 px-3 py-2.5 sm:grid-cols-[112px_minmax(0,1fr)_minmax(0,170px)_minmax(0,140px)_110px_auto] sm:py-2">
+      <div className="order-3 col-span-2 flex items-center justify-between text-[12.5px] text-muted-foreground sm:order-none sm:col-span-1">
+        <span>
+          {formatTxDate(tx.occurredAt, tx.datePrecision, zone)}
+          <span className="sm:hidden"> · {tx.source.name}</span>
+        </span>
       </div>
       <div className="min-w-0">
         <div className="truncate text-[14px] text-foreground">{tx.merchant}</div>
         {detail ? <div className="truncate text-[12.5px] text-muted-foreground">{detail}</div> : null}
       </div>
-      <div className="order-4 col-span-2 flex min-w-0 items-center gap-1.5 sm:order-none sm:col-span-1">
-        {tx.category ? <Tag color={tx.category.color}>{tx.category.name}</Tag> : <Tag>Uncategorised</Tag>}
-        {isNonSpend ? <Tag color="gray">{TYPE_LABELS[tx.type as TransactionType] ?? tx.type}</Tag> : null}
-        {tx.purposeStatus === "needs_review" ? (
-          <span className="inline-flex items-center gap-1 text-[12.5px] text-[var(--dot-red)] sm:hidden">
-            <PurposeStatusIcon status="needs_review" /> To confirm
-          </span>
-        ) : null}
+      <div className="order-4 col-span-2 flex min-w-0 flex-wrap items-center justify-between gap-2 sm:order-none sm:col-span-1">
+        <div className="flex min-w-0 items-center gap-1.5">
+          {tx.category ? <Tag color={tx.category.color}>{tx.category.name}</Tag> : <Tag>Uncategorised</Tag>}
+          {isNonSpend ? <Tag color="gray">{TYPE_LABELS[tx.type as TransactionType] ?? tx.type}</Tag> : null}
+          {tx.purposeStatus === "needs_review" ? (
+            <span className="inline-flex items-center gap-1 text-[12.5px] text-[var(--dot-red)] sm:hidden">
+              <PurposeStatusIcon status="needs_review" /> To confirm
+            </span>
+          ) : null}
+        </div>
+        {actions ? <div className="flex items-center gap-1 sm:hidden">{actions}</div> : null}
       </div>
       <div className="hidden min-w-0 items-center gap-1.5 sm:flex">
         <PurposeStatusIcon status={tx.purposeStatus} />
@@ -68,19 +87,27 @@ export function TxRow({ tx, zone, footer }: { tx: TxRowData; zone: string; foote
         <Money minor={tx.amountMinor} currency={tx.currency} type={tx.type} />
         <div className="hidden truncate text-[12px] text-muted-foreground sm:block">{tx.source.name}</div>
       </div>
+      {actions ? <div className="hidden items-center justify-end gap-1 sm:flex">{actions}</div> : null}
       {footer ? <div className="order-5 col-span-full text-[12px] text-muted-foreground sm:order-none">{footer}</div> : null}
     </li>
   );
 }
 
-export function TxListHeader() {
+export function TxListHeader({ showActions = false }: { showActions?: boolean }) {
   return (
-    <div className="hidden grid-cols-[112px_minmax(0,1fr)_minmax(0,170px)_minmax(0,140px)_110px] gap-x-4 border-b border-border px-3 pb-1.5 text-[12px] text-muted-foreground sm:grid">
+    <div
+      className={
+        showActions
+          ? "hidden grid-cols-[112px_minmax(0,1fr)_minmax(0,170px)_minmax(0,140px)_110px_68px] gap-x-4 border-b border-border px-3 pb-1.5 text-[12px] text-muted-foreground sm:grid"
+          : "hidden grid-cols-[112px_minmax(0,1fr)_minmax(0,170px)_minmax(0,140px)_110px] gap-x-4 border-b border-border px-3 pb-1.5 text-[12px] text-muted-foreground sm:grid"
+      }
+    >
       <span>Date</span>
       <span>Merchant</span>
       <span>Category</span>
       <span>Subcategory</span>
       <span className="text-right">Amount</span>
+      {showActions ? <span className="text-right">Actions</span> : null}
     </div>
   );
 }

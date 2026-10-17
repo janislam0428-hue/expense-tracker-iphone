@@ -10,7 +10,11 @@ export const metadata: Metadata = { title: "Transactions" };
 export default async function TransactionsPage() {
   await requireAuth();
   const settings = await getSettings();
-  const where = { ...demoScope(settings), duplicateOfId: null, occurredAt: { lt: new Date() } };
+  const where = {
+    ...demoScope(settings),
+    duplicateOfId: null,
+    OR: [{ isDemo: false }, { occurredAt: { lt: new Date() } }],
+  };
 
   const [rows, total, categories, sources] = await Promise.all([
     db.transaction.findMany({

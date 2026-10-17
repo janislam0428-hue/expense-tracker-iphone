@@ -174,6 +174,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS "Budget_categoryId_period_key" ON "Budget"("ca
 
 const globalForInit = globalThis as unknown as { __tallyDbReady?: Promise<void> };
 
+async function cleanupMisdetectedBalanceRows(): Promise<void> {
+  try {
+    const candidates = await db.transaction.findMany({
+      where: { isDemo: false, purposeStatus: "needs_review" },
+      select: { id: true, merchant: true },
+    });
+    const badIds = candidates
+      .filter(
+        (c) =>
+          /\b(?:new balance|remaining balance|balance is)\b/i.test(c.merchant) ||
+          /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+)?\d{1,2}:\d{2}$/i.test(c.merchant.trim()) ||
+          /^\d+\s*[hm]\s*ago$/i.test(c.merchant.trim()),
+      )
+      .map((c) => c.id);
+    if (badIds.length > 0) {
+      await db.transaction.deleteMany({ where: { id: { in: badIds } } });
+    }
+  } catch {
+    // Non-fatal cleanup
+  }
+}
+
 async function runInit(): Promise<void> {
   let existing = null;
   try {
@@ -187,6 +209,9 @@ async function runInit(): Promise<void> {
   }
 
   if (existing) {
+    // Clean up any misdetected balance/timestamp rows from earlier screenshots
+    await cleanupMisdetectedBalanceRows();
+
     // Check if the 9-category taxonomy migration still needs to be applied
     const [legacyFound, newFoodFound] = await Promise.all([
       db.category.findFirst({

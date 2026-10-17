@@ -6,10 +6,11 @@ import { db } from "@/lib/db";
 import { requireAuth } from "@/lib/auth/session";
 import { toMinor } from "@/lib/money";
 import { normalizeMerchant, shortHash } from "@/lib/text";
-import { formatInZone } from "@/lib/time";
+import { formatInZone, zonedDate } from "@/lib/time";
 import { decideReview } from "@/lib/review/rules";
 
-const addSchema = z.object({
+const txFormSchema = z.object({
+  id: z.string().optional(),
   amount: z
     .string()
     .trim()
@@ -26,9 +27,19 @@ const addSchema = z.object({
 
 export type ActionState = { ok?: string; error?: string } | undefined;
 
+function parseLocalDateTime(value: string | undefined | null, zone: string): Date | null {
+  if (!value) return null;
+  const m = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (m) {
+    return zonedDate(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), zone);
+  }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 export async function addTransaction(_prev: ActionState, formData: FormData): Promise<ActionState> {
   await requireAuth();
-  const parsed = addSchema.safeParse(Object.fromEntries(formData));
+  const parsed = txFormSchema.safeParse(Object.fromEntries(formData));
   if (!parsed.success) {
     return { error: parsed.error.issues[0]?.message ?? "Invalid form data" };
   }
@@ -37,7 +48,7 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
   const settings = await db.settings.findUniqueOrThrow({ where: { id: 1 } });
   const amountMinor = toMinor(d.amount);
   const merchantNormalized = normalizeMerchant(d.merchant);
-  const occurredAt = d.occurredAt ? new Date(d.occurredAt) : new Date();
+  const occurredAt = parseLocalDateTime(d.occurredAt, settings.timezone) ?? new Date();
 
   const category = d.categoryId ? await db.category.findUnique({ where: { id: d.categoryId } }) : null;
   const subcategory =
@@ -81,6 +92,54 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
 
   revalidatePath("/", "layout");
   return { ok: `Added ${d.merchant} (${settings.currency} ${d.amount})` };
+}
+
+export async function updateTransaction(_prev: ActionState, formData: FormData): Promise<ActionState> {
+  await requireAuth();
+  const parsed = txFormSchema.safeParse(Object.fromEntries(formData));
+  if (!parsed.success || !parsed.data.id) {
+    return { error: parsed.error?.issues[0]?.message ?? "Invalid transaction data" };
+  }
+
+  const d = parsed.data;
+  const settings = await db.settings.findUniqueOrThrow({ where: { id: 1 } });
+  const existing = await db.transaction.findUnique({ where: { id: d.id } });
+  if (!existing) return { error: "Transaction not found" };
+
+  const amountMinor = toMinor(d.amount);
+  const merchantNormalized = normalizeMerchant(d.merchant);
+  const occurredAt = parseLocalDateTime(d.occurredAt, settings.timezone) ?? existing.occurredAt;
+
+  const category =
+    d.categoryId && d.categoryId !== "none"
+      ? await db.category.findUnique({ where: { id: d.categoryId } })
+      : null;
+  const subcategory =
+    d.subcategoryId && d.subcategoryId !== "none" && category
+      ? await db.category.findFirst({ where: { id: d.subcategoryId, parentId: category.id, archived: false } })
+      : null;
+
+  await db.transaction.update({
+    where: { id: d.id },
+    data: {
+      merchant: d.merchant,
+      merchantNormalized,
+      amountMinor,
+      occurredAt,
+      datePrecision: "minute",
+      type: d.type,
+      sourceId: d.sourceId,
+      categoryId: category?.id ?? null,
+      subcategoryId: subcategory?.id ?? null,
+      description: d.notes?.trim() || null,
+      notes: null,
+      purposeStatus: "confirmed",
+      reviewReasons: "[]",
+    },
+  });
+
+  revalidatePath("/", "layout");
+  return { ok: `Updated ${d.merchant}` };
 }
 
 export async function deleteTransaction(id: string): Promise<ActionState> {

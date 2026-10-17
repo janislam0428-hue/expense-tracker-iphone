@@ -125,7 +125,7 @@ export async function ingestNotificationRecord(
 
   // 4. Deterministic fingerprint for duplicate detection
   const dayStr = formatInZone(occurredAt, "yyyy-MM-dd", settings.timezone);
-  const fingerprint = `auto:${shortHash(`${source.name}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}|${parsed.location ?? ""}`)}`;
+  const fingerprint = `auto:${shortHash(`${source.name}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}|${parsed.location ?? ""}|${parsed.balanceAfterMinor ?? ""}`)}`;
 
   // Look for duplicate on the same day from previous import batches
   const windowStart = new Date(occurredAt.getTime() - 24 * 3600 * 1000);
