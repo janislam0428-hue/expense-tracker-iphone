@@ -11,19 +11,19 @@ import { TxListHeader, TxRow, type TxRowData } from "@/components/app/tx-row";
 import { addTransaction, deleteTransaction } from "./actions";
 
 type Option = { id: string; name: string };
+type CategoryOption = { id: string; name: string; children?: Option[] };
 
 export function TransactionsView({
   initialTransactions,
   categories,
   sources,
-  purposes,
   zone,
   currency,
 }: {
   initialTransactions: TxRowData[];
-  categories: Option[];
+  categories: CategoryOption[];
   sources: Option[];
-  purposes: Option[];
+  purposes?: Option[];
   zone: string;
   currency: string;
 }) {
@@ -32,14 +32,20 @@ export function TransactionsView({
   const [selectedCat, setSelectedCat] = useState<string>("all");
   const [selectedSource, setSelectedSource] = useState<string>("all");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [modalCategoryId, setModalCategoryId] = useState<string>(categories[0]?.id ?? "");
+  const [modalSubcategoryId, setModalSubcategoryId] = useState<string>("none");
   const [pending, startTransition] = useTransition();
+
+  const activeModalCategory = categories.find((c) => c.id === modalCategoryId);
+  const modalSubcategories = activeModalCategory?.children ?? [];
 
   const filtered = transactions.filter((t) => {
     if (search.trim()) {
       const q = search.toLowerCase();
       const matchMerchant = t.merchant.toLowerCase().includes(q);
       const matchDesc = t.description?.toLowerCase().includes(q) ?? false;
-      if (!matchMerchant && !matchDesc) return false;
+      const matchSub = t.subcategory?.name.toLowerCase().includes(q) ?? false;
+      if (!matchMerchant && !matchDesc && !matchSub) return false;
     }
     if (selectedCat !== "all") {
       if (t.category?.name !== selectedCat) return false;
@@ -145,6 +151,11 @@ export function TransactionsView({
 
             <form
               action={async (formData) => {
+                if (modalSubcategoryId && modalSubcategoryId !== "none") {
+                  formData.set("subcategoryId", modalSubcategoryId);
+                } else {
+                  formData.delete("subcategoryId");
+                }
                 const res = await addTransaction(undefined, formData);
                 if (res?.ok) {
                   toast.success(res.ok);
@@ -212,7 +223,14 @@ export function TransactionsView({
                   <Label htmlFor="categoryId" className="text-[13px]">
                     Category
                   </Label>
-                  <Select name="categoryId" defaultValue={categories[0]?.id}>
+                  <Select
+                    name="categoryId"
+                    value={modalCategoryId}
+                    onValueChange={(val) => {
+                      setModalCategoryId(val);
+                      setModalSubcategoryId("none");
+                    }}
+                  >
                     <SelectTrigger id="categoryId" className="w-full">
                       <SelectValue />
                     </SelectTrigger>
@@ -227,23 +245,26 @@ export function TransactionsView({
                 </div>
               </div>
 
-              <div className="grid gap-1">
-                <Label htmlFor="purposeId" className="text-[13px]">
-                  Purpose
-                </Label>
-                <Select name="purposeId" defaultValue={purposes[0]?.id}>
-                  <SelectTrigger id="purposeId" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {purposes.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              {modalSubcategories.length > 0 && (
+                <div className="grid gap-1">
+                  <Label htmlFor="subcategoryId" className="text-[13px]">
+                    Subcategory (optional)
+                  </Label>
+                  <Select value={modalSubcategoryId} onValueChange={setModalSubcategoryId}>
+                    <SelectTrigger id="subcategoryId" className="w-full">
+                      <SelectValue placeholder="Not specified" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">Not specified</SelectItem>
+                      {modalSubcategories.map((sub) => (
+                        <SelectItem key={sub.id} value={sub.id}>
+                          {sub.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
 
               <div className="grid gap-1">
                 <Label htmlFor="notes" className="text-[13px]">

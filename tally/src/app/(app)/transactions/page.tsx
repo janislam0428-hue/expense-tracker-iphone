@@ -12,7 +12,7 @@ export default async function TransactionsPage() {
   const settings = await getSettings();
   const where = { ...demoScope(settings), duplicateOfId: null, occurredAt: { lt: new Date() } };
 
-  const [rows, total, categories, sources, purposes] = await Promise.all([
+  const [rows, total, categories, sources] = await Promise.all([
     db.transaction.findMany({
       where,
       orderBy: { occurredAt: "desc" },
@@ -20,9 +20,12 @@ export default async function TransactionsPage() {
       include: { category: true, subcategory: true, source: true, purpose: true },
     }),
     db.transaction.count({ where }),
-    db.category.findMany({ where: { parentId: null, archived: false }, orderBy: { sortOrder: "asc" } }),
+    db.category.findMany({
+      where: { parentId: null, archived: false },
+      orderBy: { sortOrder: "asc" },
+      include: { children: { where: { archived: false }, orderBy: { sortOrder: "asc" } } },
+    }),
     db.paymentSource.findMany({ where: { isActive: true } }),
-    db.purpose.findMany({ orderBy: { sortOrder: "asc" } }),
   ]);
 
   return (
@@ -33,9 +36,12 @@ export default async function TransactionsPage() {
       />
       <TransactionsView
         initialTransactions={rows}
-        categories={categories.map((c) => ({ id: c.id, name: c.name }))}
+        categories={categories.map((c) => ({
+          id: c.id,
+          name: c.name,
+          children: c.children.map((s) => ({ id: s.id, name: s.name })),
+        }))}
         sources={sources.map((s) => ({ id: s.id, name: s.name }))}
-        purposes={purposes.map((p) => ({ id: p.id, name: p.name }))}
         zone={settings.timezone}
         currency={settings.currency}
       />

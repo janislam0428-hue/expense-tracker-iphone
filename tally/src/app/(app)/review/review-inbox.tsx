@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { CheckCheck, Sparkles, Inbox } from "lucide-react";
+import { Check, CheckCheck, Sparkles, Inbox } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tag } from "@/components/app/tag";
@@ -25,7 +25,7 @@ export type PendingTx = {
   subcategoryId: string | null;
   category: { name: string; color: string } | null;
   source: { name: string };
-  purpose: { name: string; color: string } | null;
+  purpose?: { name: string; color: string } | null;
 };
 
 export type PurposeOption = {
@@ -39,25 +39,26 @@ type CategoryOption = { id: string; name: string; children: { id: string; name: 
 
 export function ReviewInbox({
   initialTransactions,
-  purposes,
   categories,
   zone,
 }: {
   initialTransactions: PendingTx[];
-  purposes: PurposeOption[];
+  purposes?: PurposeOption[];
   categories: CategoryOption[];
   zone: string;
 }) {
   const [items, setItems] = useState(initialTransactions);
   const [rememberRules, setRememberRules] = useState<Record<string, boolean>>({});
-  const [classifications, setClassifications] = useState<Record<string, { categoryId: string; subcategoryId: string | null }>>({});
+  const [classifications, setClassifications] = useState<
+    Record<string, { categoryId: string; subcategoryId: string | null }>
+  >({});
   const [pending, startTransition] = useTransition();
 
-  const handleConfirm = (txId: string, purposeId: string, merchant: string) => {
+  const handleConfirm = (txId: string, merchant: string) => {
     const saveRule = !!rememberRules[txId];
     startTransition(async () => {
       const selection = classifications[txId];
-      const res = await confirmPurpose({ transactionId: txId, purposeId, saveRule, ...selection });
+      const res = await confirmPurpose({ transactionId: txId, saveRule, ...selection });
       if (res.ok) {
         setClassifications((prev) => {
           const next = { ...prev };
@@ -65,7 +66,7 @@ export function ReviewInbox({
           return next;
         });
         setItems((prev) => prev.filter((i) => i.id !== txId));
-        toast.success(`Confirmed ${merchant} ${saveRule ? "(rule saved)" : ""}`);
+        toast.success(`Confirmed ${merchant}${saveRule ? " (rule saved)" : ""}`);
       } else {
         toast.error(res.error || "Failed");
       }
@@ -73,7 +74,7 @@ export function ReviewInbox({
   };
 
   const handleConfirmAll = () => {
-    if (!confirm("Confirm all pending transactions as Personal?")) return;
+    if (!confirm("Confirm all pending transactions with their current categories?")) return;
     startTransition(async () => {
       const res = await confirmAllAsPersonal();
       if (res.ok) {
@@ -111,12 +112,18 @@ export function ReviewInbox({
           <span className="text-[14px] font-medium text-foreground">
             {items.length} transaction{items.length === 1 ? "" : "s"} waiting
           </span>
-          <span className="text-[12px] text-muted-foreground">· One tap to confirm</span>
+          <span className="text-[12px] text-muted-foreground">· Pick category &amp; confirm</span>
         </div>
 
-        <Button variant="outline" size="sm" onClick={handleConfirmAll} disabled={pending || Object.keys(classifications).length > 0} className="gap-1.5 min-h-11">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleConfirmAll}
+          disabled={pending || Object.keys(classifications).length > 0}
+          className="gap-1.5 min-h-11"
+        >
           <CheckCheck className="size-3.5" />
-          Confirm all as Personal
+          Confirm all
         </Button>
       </div>
 
@@ -125,7 +132,8 @@ export function ReviewInbox({
           const reasons = parseJsonArray(tx.reviewReasons);
           const remember = rememberRules[tx.id] ?? false;
           const selection = classifications[tx.id] ?? {
-            categoryId: tx.categoryId ?? "", subcategoryId: tx.subcategoryId,
+            categoryId: tx.categoryId ?? "",
+            subcategoryId: tx.subcategoryId,
           };
           const selectedCategory = categories.find((c) => c.id === selection.categoryId);
 
@@ -146,9 +154,7 @@ export function ReviewInbox({
                     {tx.description ? <span>· {tx.description}</span> : null}
                     {reasons.length > 0 ? (
                       <span className="text-[var(--dot-red)]">
-                        (
-                        {reasons.map((r) => REVIEW_REASONS[r as ReviewReason] ?? r).join(", ")}
-                        )
+                        ({reasons.map((r) => REVIEW_REASONS[r as ReviewReason] ?? r).join(", ")})
                       </span>
                     ) : null}
                   </div>
@@ -169,13 +175,20 @@ export function ReviewInbox({
                   id={`category-${tx.id}`}
                   value={selection.categoryId}
                   disabled={pending}
-                  onChange={(event) => setClassifications((prev) => ({
-                    ...prev, [tx.id]: { categoryId: event.target.value, subcategoryId: null },
-                  }))}
+                  onChange={(event) =>
+                    setClassifications((prev) => ({
+                      ...prev,
+                      [tx.id]: { categoryId: event.target.value, subcategoryId: null },
+                    }))
+                  }
                   className="min-h-11 w-full max-w-sm rounded-md border border-input bg-background px-3 text-sm"
                 >
                   <option value="">Uncategorised</option>
-                  {categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
                 </select>
                 {selectedCategory && selectedCategory.children.length > 0 ? (
                   <fieldset className="min-w-0">
@@ -187,9 +200,12 @@ export function ReviewInbox({
                           type="button"
                           disabled={pending}
                           aria-pressed={(selection.subcategoryId ?? "") === child.id}
-                          onClick={() => setClassifications((prev) => ({
-                            ...prev, [tx.id]: { ...selection, subcategoryId: child.id || null },
-                          }))}
+                          onClick={() =>
+                            setClassifications((prev) => ({
+                              ...prev,
+                              [tx.id]: { ...selection, subcategoryId: child.id || null },
+                            }))
+                          }
                           className="min-h-11 rounded-md border border-border px-3 text-[12.5px] transition-colors aria-pressed:border-primary aria-pressed:bg-accent aria-pressed:font-semibold focus-visible:outline-2 focus-visible:outline-primary"
                         >
                           {child.name}
@@ -198,31 +214,9 @@ export function ReviewInbox({
                     </div>
                   </fieldset>
                 ) : null}
-                <p className="text-[12px] text-muted-foreground">Choose a purpose below to save. Subcategory can be left unspecified.</p>
               </div>
 
-              {/* Purpose Selection Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-border/50">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[12px] font-medium text-muted-foreground mr-1">Choose Purpose:</span>
-                  {purposes.map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      disabled={pending}
-                      onClick={() => handleConfirm(tx.id, p.id, tx.merchant)}
-                      className="inline-flex min-h-11 items-center gap-1 rounded-md px-2.5 text-[12.5px] font-medium transition-all hover:scale-105 active:scale-95"
-                      style={{
-                        background: `var(--tag-${p.color}-bg)`,
-                        color: `var(--tag-${p.color}-fg)`,
-                      }}
-                    >
-                      {p.name}
-                      {p.shortcutKey ? <span className="opacity-60 text-[10.5px]">[{p.shortcutKey}]</span> : null}
-                    </button>
-                  ))}
-                </div>
-
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-border/50">
                 <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground cursor-pointer select-none">
                   <input
                     type="checkbox"
@@ -233,6 +227,17 @@ export function ReviewInbox({
                   <Sparkles className="size-3 text-warning" />
                   <span>Remember rule for {tx.merchant}</span>
                 </label>
+
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={pending}
+                  onClick={() => handleConfirm(tx.id, tx.merchant)}
+                  className="gap-1.5 min-h-10 px-4"
+                >
+                  <Check className="size-4" />
+                  Confirm
+                </Button>
               </div>
             </div>
           );

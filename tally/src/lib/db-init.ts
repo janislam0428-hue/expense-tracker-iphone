@@ -3,6 +3,7 @@ import { createClient } from "@libsql/client";
 import { db } from "./db";
 import { cleanEnv } from "./db-client";
 import { ensureReferenceData } from "./reference/ensure";
+import { LEGACY_CATEGORIES, migrateTaxonomy } from "./reference/migrate-taxonomy";
 import { loadDemoData } from "./demo/apply";
 
 const SCHEMA_SQL = `
@@ -174,15 +175,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS "Budget_categoryId_period_key" ON "Budget"("ca
 const globalForInit = globalThis as unknown as { __tallyDbReady?: Promise<void> };
 
 async function runInit(): Promise<void> {
+  let existing = null;
   try {
-    const existing = await db.settings.findUnique({ where: { id: 1 } });
-    if (existing) return;
+    existing = await db.settings.findUnique({ where: { id: 1 } });
   } catch {
     // Table does not exist yet — create schema via libSQL client
     const url = cleanEnv(process.env.DATABASE_URL) ?? "file:./data/tally.db";
     const authToken = cleanEnv(process.env.DATABASE_AUTH_TOKEN);
     const client = createClient({ url, authToken });
     await client.executeMultiple(SCHEMA_SQL);
+  }
+
+  if (existing) {
+    // Check if the 9-category taxonomy migration still needs to be applied
+    const [legacyFound, newFoodFound] = await Promise.all([
+      db.category.findFirst({
+        where: {
+          OR: [
+            { name: { in: Object.keys(LEGACY_CATEGORIES) }, parentId: null, archived: false },
+            { name: { in: ["MTR", "Bus", "Minibus", "Taxi"] }, archived: false },
+          ],
+        },
+      }),
+      db.category.findFirst({
+        where: { name: "Food", parentId: null, archived: false },
+      }),
+    ]);
+
+    if (legacyFound || !newFoodFound) {
+      await migrateTaxonomy(db);
+    }
+    return;
   }
 
   await ensureReferenceData(db);
@@ -196,8 +219,8 @@ async function runInit(): Promise<void> {
 }
 
 /**
- * Automatically creates tables and reference data on first run so the user
- * never has to manually execute SQL migrations or CLI commands on Turso.
+ * Automatically creates tables, reference data, and applies taxonomy migrations
+ * on first run so the user never has to manually execute CLI commands on Turso.
  */
 export async function ensureDatabaseInitialized(): Promise<void> {
   if (!globalForInit.__tallyDbReady) {

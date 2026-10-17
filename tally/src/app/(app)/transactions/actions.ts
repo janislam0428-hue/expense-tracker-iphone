@@ -17,6 +17,7 @@ const addSchema = z.object({
   merchant: z.string().trim().min(1, "Merchant name is required"),
   occurredAt: z.string().optional(),
   categoryId: z.string().optional(),
+  subcategoryId: z.string().optional(),
   sourceId: z.string().min(1, "Select a payment source"),
   purposeId: z.string().optional(),
   type: z.enum(["expense", "income", "top_up", "refund", "transfer"]).default("expense"),
@@ -39,12 +40,16 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
   const occurredAt = d.occurredAt ? new Date(d.occurredAt) : new Date();
 
   const category = d.categoryId ? await db.category.findUnique({ where: { id: d.categoryId } }) : null;
+  const subcategory =
+    d.subcategoryId && category
+      ? await db.category.findFirst({ where: { id: d.subcategoryId, parentId: category.id, archived: false } })
+      : null;
 
   const review = decideReview({
     amountMinor,
     type: d.type,
     categoryAmbiguous: category ? category.ambiguous : null,
-    hasRulePurpose: !!d.purposeId,
+    hasRulePurpose: !!(d.categoryId || d.purposeId),
     isPersonToPerson: false,
     reviewThresholdMinor: settings.reviewThresholdMinor,
   });
@@ -60,13 +65,14 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
       currency: settings.currency,
       merchant: d.merchant,
       merchantNormalized,
-      categoryId: d.categoryId || null,
+      categoryId: category?.id ?? null,
+      subcategoryId: subcategory?.id ?? null,
       sourceId: d.sourceId,
       channel: "manual",
       type: d.type,
       purposeId: d.purposeId || null,
-      purposeStatus: d.purposeId ? "confirmed" : review.status,
-      reviewReasons: JSON.stringify(review.reasons),
+      purposeStatus: category ? "confirmed" : review.status,
+      reviewReasons: category ? "[]" : JSON.stringify(review.reasons),
       notes: d.notes || null,
       fingerprint,
       isDemo: false,

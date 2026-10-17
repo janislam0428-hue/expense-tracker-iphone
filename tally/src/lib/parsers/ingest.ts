@@ -112,17 +112,13 @@ export async function ingestNotificationRecord(
     });
     subcategoryId = child?.id ?? null;
   }
-  if (!purposeId && category?.name === "Transport") {
-    const personal = await db.purpose.findUnique({ where: { name: "Personal" } });
-    purposeId = personal?.id ?? null;
-  }
 
-  // 3. Decide review status
+  // 3. Decide review status (a saved merchant rule with a category or purpose skips review)
   const review = decideReview({
     amountMinor: parsed.amountMinor,
     type: parsed.type,
     categoryAmbiguous: category ? category.ambiguous : null,
-    hasRulePurpose: !!matchedRule?.purposeId,
+    hasRulePurpose: !!(matchedRule?.categoryId || matchedRule?.purposeId),
     isPersonToPerson: parsed.isPersonToPerson,
     reviewThresholdMinor: settings.reviewThresholdMinor,
   });

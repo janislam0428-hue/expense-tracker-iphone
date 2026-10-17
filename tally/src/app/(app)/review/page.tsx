@@ -11,13 +11,12 @@ export default async function ReviewPage() {
   await requireAuth();
   const settings = await getSettings();
 
-  const [rows, purposes, categories] = await Promise.all([
+  const [rows, categories] = await Promise.all([
     db.transaction.findMany({
       where: { ...demoScope(settings), purposeStatus: "needs_review", duplicateOfId: null },
       orderBy: { occurredAt: "desc" },
       include: { category: true, subcategory: true, source: true, purpose: true },
     }),
-    db.purpose.findMany({ orderBy: { sortOrder: "asc" } }),
     db.category.findMany({
       where: { parentId: null, archived: false },
       orderBy: { sortOrder: "asc" },
@@ -29,19 +28,14 @@ export default async function ReviewPage() {
     <div className="flex flex-col gap-6">
       <PageHeader
         title="To confirm"
-        description="Transactions where the purpose isn't obvious or exceeds your review threshold. Small everyday fares are auto-confirmed."
+        description="Transactions where the category isn't obvious or the amount exceeds your review threshold. Small everyday fares are auto-confirmed."
       />
       <ReviewInbox
         initialTransactions={rows}
         categories={categories.map((c) => ({
-          id: c.id, name: c.name,
+          id: c.id,
+          name: c.name,
           children: c.children.map((s) => ({ id: s.id, name: s.name })),
-        }))}
-        purposes={purposes.map((p) => ({
-          id: p.id,
-          name: p.name,
-          color: p.color,
-          shortcutKey: p.shortcutKey,
         }))}
         zone={settings.timezone}
       />

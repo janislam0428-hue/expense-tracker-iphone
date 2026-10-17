@@ -4,6 +4,7 @@ import { db } from "@/lib/db";
 import { ensureDatabaseInitialized } from "@/lib/db-init";
 import { ingestNotificationRecord } from "@/lib/parsers/ingest";
 import { parseMultipleNotifications } from "@/lib/parsers/notification";
+import { normalizeMerchant } from "@/lib/text";
 
 function sha256(str: string): Buffer {
   return createHash("sha256").update(str).digest();
@@ -79,8 +80,37 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2. Extract notification text or structured items
+    // 2. Direct structured fields support (e.g. from Apple Wallet automation)
     if (payloadJson) {
+      const directAmount = payloadJson.Amount ?? payloadJson.amount ?? payloadJson.value;
+      const directMerchant = payloadJson.Merchant ?? payloadJson.merchant ?? payloadJson.payee;
+
+      if (directAmount !== undefined && directMerchant !== undefined) {
+        const amountMinor = Math.round(parseFloat(String(directAmount).replace(/[^0-9.]/g, "")) * 100);
+        const merchant = String(directMerchant).trim();
+        const cardName = String(payloadJson.Card ?? payloadJson.card ?? payloadJson.source ?? "Octopus").trim();
+        const isOctopus = cardName.toLowerCase().includes("octopus");
+
+        const result = await ingestNotificationRecord(db, {
+          parsed: {
+            amountMinor,
+            currency: String(payloadJson.Currency ?? payloadJson.currency ?? "HKD"),
+            merchant,
+            merchantNormalized: normalizeMerchant(merchant),
+            type: "expense",
+            sourceName: isOctopus ? "Octopus" : cardName,
+            sourceKind: isOctopus ? "octopus" : "credit_card",
+            datePrecision: "minute",
+            isPersonToPerson: false,
+            confidence: 1.0,
+            rawText: JSON.stringify(payloadJson),
+          },
+          channel: "shortcut",
+        });
+
+        return NextResponse.json(result);
+      }
+
       if (typeof payloadJson.text === "string") {
         rawText = payloadJson.text;
       } else if (typeof payloadJson.notification === "string") {
@@ -88,16 +118,28 @@ export async function POST(req: NextRequest) {
       } else if (typeof payloadJson.body === "string") {
         rawText = payloadJson.body;
       } else if (Array.isArray(payloadJson.records)) {
-        // Batch ingestion
+        const batch = await db.importBatch.create({
+          data: {
+            channel: "shortcut",
+            sourceHint: "iPhone 14 Pro Batch",
+            capturedAt: new Date(),
+          },
+        });
         const results = [];
         for (const item of payloadJson.records) {
           const itemText = typeof item === "string" ? item : item?.text || "";
           if (itemText) {
-            const r = await ingestNotificationRecord(db, { text: itemText, channel: "shortcut" });
+            const r = await ingestNotificationRecord(db, { text: itemText, channel: "shortcut", batchId: batch.id });
             results.push(r);
           }
         }
         const addedCount = results.filter((r) => r.ok && !r.isDuplicate).length;
+        const skippedCount = results.filter((r) => r.isDuplicate).length;
+        const reviewCount = results.filter((r) => r.purposeStatus === "needs_review").length;
+        await db.importBatch.update({
+          where: { id: batch.id },
+          data: { added: addedCount, skippedDuplicates: skippedCount, needsReview: reviewCount },
+        });
         return NextResponse.json({
           ok: true,
           message: `Processed ${results.length} records. Added ${addedCount}.`,
@@ -108,35 +150,60 @@ export async function POST(req: NextRequest) {
 
     if (!rawText.trim()) {
       return NextResponse.json(
-        { ok: false, error: "Missing text. Provide 'text' in JSON or raw notification text in request body." },
+        {
+          ok: false,
+          error: "Missing text. Provide 'text' in JSON or raw notification text in request body.",
+          receivedKeys: payloadJson ? Object.keys(payloadJson) : [],
+        },
         { status: 400 },
       );
     }
 
-    // Check if multi-line notifications are present (e.g. from Notification Center screenshot)
+    // Check if multi-line notifications or Wallet screenshot list are present
     const multi = parseMultipleNotifications(rawText);
     if (multi.length > 1) {
+      const batch = await db.importBatch.create({
+        data: {
+          channel: "shortcut",
+          sourceHint: "iPhone 14 Pro Screenshot",
+          capturedAt: new Date(),
+        },
+      });
       const results = [];
       for (const parsed of multi) {
-        const r = await ingestNotificationRecord(db, { parsed, channel: "shortcut" });
+        const r = await ingestNotificationRecord(db, { parsed, channel: "shortcut", batchId: batch.id });
         results.push(r);
       }
       const added = results.filter((r) => r.ok && !r.isDuplicate).length;
+      const skipped = results.filter((r) => r.isDuplicate).length;
+      const review = results.filter((r) => r.purposeStatus === "needs_review").length;
+      await db.importBatch.update({
+        where: { id: batch.id },
+        data: { added, skippedDuplicates: skipped, needsReview: review },
+      });
       return NextResponse.json({
         ok: true,
-        message: `Processed ${multi.length} notifications. Added ${added}.`,
+        message: `Imported ${added} transaction(s) from screenshot${skipped ? ` (${skipped} duplicate skipped)` : ""}.`,
         results,
       });
     }
 
     // Single notification ingestion
     const result = await ingestNotificationRecord(db, {
+      parsed: multi[0],
       text: rawText,
       channel: "shortcut",
     });
 
     if (!result.ok) {
-      return NextResponse.json({ ok: false, error: result.message }, { status: 422 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: result.message,
+          receivedText: rawText.slice(0, 300),
+        },
+        { status: 422 },
+      );
     }
 
     return NextResponse.json(result);
