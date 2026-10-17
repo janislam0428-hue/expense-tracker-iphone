@@ -76,7 +76,8 @@ export async function ingestNotificationRecord(
   }
 
   // 2. Strict Duplicate Detection:
-  //    Prevent duplicates when uploading the same screenshot or notification more than once.
+  //    Prevent duplicates when uploading the same screenshot, overlapping scrolled screenshots,
+  //    or both an email notification and an app history screenshot for the same payment.
   const dayStr = formatInZone(occurredAt, "yyyy-MM-dd", settings.timezone);
   const minuteStr = formatInZone(occurredAt, "yyyy-MM-dd'T'HH:mm", settings.timezone);
   const fingerprint = `auto:${shortHash(`${source.id}|${dayStr}|${parsed.amountMinor}|${parsed.merchantNormalized}|${parsed.balanceAfterMinor ?? ""}`)}`;
@@ -105,7 +106,13 @@ export async function ingestNotificationRecord(
               },
             ]
           : []),
-        // C. Same deterministic fingerprint on the same day across uploads
+        // C. Same payment source + same day + same amount + same normalized merchant across uploads
+        {
+          merchantNormalized: parsed.merchantNormalized,
+          occurredAt: { gte: startOfDay, lt: endOfDay },
+          ...(input.batchId ? { NOT: { importBatchId: input.batchId } } : {}),
+        },
+        // D. Same deterministic fingerprint on the same day across uploads
         {
           fingerprint,
           occurredAt: { gte: startOfDay, lt: endOfDay },
