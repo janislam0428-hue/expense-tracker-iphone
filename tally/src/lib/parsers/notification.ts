@@ -1,10 +1,11 @@
 // Zero-credit on-device/local notification & screenshot parser.
 // Supports:
-//  1. Apple Wallet & Lock Screen Octopus notifications & "Latest Transactions" screenshots
-//  2. PayMe App transaction history screenshots & Gmail App (popup banners, inbox list, and opened emails)
-//  3. Hang Seng Bank App transaction history screenshots & Gmail App e-Alert emails/banners
-// Automatically filters out remaining balances, Octopus top-ups, and PayMe bank top-ups
-// (including "LAM JANIS SZE YUET HKDD5326818092" and "APPLEPAY OCTOPUS CAR").
+//  1. Octopus App transaction history screenshots ("Octopus 1 / 192116091(2)", "2026-09-27 16:53 -142.5") — Authoritative Source of Truth for Octopus
+//  2. Apple Wallet & Lock Screen Octopus notifications & "Latest Transactions" screenshots
+//  3. PayMe App transaction history screenshots & Gmail App / Apple Mail (popup banners, inbox list, and opened emails)
+//  4. Hang Seng Bank App transaction history screenshots & e-Alert emails/banners
+// Automatically filters out remaining balances, Octopus top-ups ("Octopus Cards Limited +600.0", "APPLEPAY OCTOPUS CAR"),
+// and PayMe bank top-ups ("LAM JANIS SZE YUET HKDD5326818092", "Hang Seng Bank Lim... **0882").
 
 import { normalizeMerchant } from "@/lib/text";
 import { addZonedDays, zonedDate, zonedParts } from "@/lib/time";
@@ -26,6 +27,7 @@ export type ParsedNotification = {
   occurredAt?: Date;
   datePrecision: DatePrecision;
   isPersonToPerson: boolean;
+  isAuthoritativeSource?: boolean;
   confidence: number;
   rawText: string;
 };
@@ -92,6 +94,17 @@ const MONTH_INDEX: Record<string, number> = {
 };
 
 /**
+ * Checks whether a merchant name is a generic placeholder from Apple Wallet / Express Transit
+ * rather than an authoritative merchant name from the Octopus App.
+ */
+export function isGenericWalletMerchant(merchant: string): boolean {
+  const m = normalizeMerchant(merchant);
+  return /^(?:octopus purchase|octopus|purchase|bus|train|transit|minibus|ferry|tram|light rail|public transport|八達通|零售|消費|付款)$/.test(
+    m,
+  );
+}
+
+/**
  * Checks whether a line is a balance statement (e.g. "Your new balance is HK$133.60.")
  * so it is NEVER mistaken for a spending transaction.
  */
@@ -103,8 +116,9 @@ export function isBalanceLine(line: string): boolean {
 
 /**
  * Checks whether a line or merchant is a top-up / reload / self-funding transfer:
- * - Explicit "+ 655.40" or "+HK$100.00"
+ * - Explicit "+ 655.40", "+600.0", or "+HK$100.00"
  * - "Top up", "Add value", "Reload", "Auto top-up", "AAV", "增值", "自動增值"
+ * - Octopus App AAVS / reload merchant: "Octopus Cards Limited"
  * - Hang Seng -> PayMe direct debit top-ups: "LAM JANIS SZE YUET", "HKDD5326818092", "HKDD..."
  * - Hang Seng / Apple Pay -> Octopus top-ups: "APPLEPAY OCTOPUS", "OCTOPUS CAR", "OCTOPUS CARD"
  * - PayMe bank top-up subtitle: "Hang Seng Bank Lim... **0882"
@@ -115,7 +129,8 @@ export function isTopUpLine(line: string): boolean {
   if (/([+])\s*(?:HKD|HK\$|\$)\s*[0-9,]+(?:\.[0-9]{1,2})?/i.test(s)) return true;
   if (/\b(?:top-?up|topped up|add value|added value|reload|auto top-?up|aav|octopus top up|增值|自動增值)\b/i.test(s))
     return true;
-  if (/\b(?:lam janis|sze yuet|hkdd\d+|applepay octopus|octopus car|octopus card)\b/i.test(s)) return true;
+  if (/\b(?:lam janis|sze yuet|hkdd\d+|applepay octopus|octopus car|octopus card|octopus cards limited)\b/i.test(s))
+    return true;
   if (/hang seng bank lim.*\*\*\d{4}/i.test(s)) return true;
   return false;
 }
@@ -132,7 +147,7 @@ function extractBalanceMinor(line: string): number | undefined {
 
 /**
  * Resolves any date, relative weekday, bank date code ("14OCT"), or timestamp label into a concrete Date in Hong Kong time:
- * - Explicit dates (>1 week ago): "2026-10-07", "23:50 10/10/2026", "07/10/2026", "7 Oct 2026", "14OCT", "10月7日"
+ * - Explicit dates (>1 week ago): "2026-09-27 16:53", "2026-10-07", "23:50 10/10/2026", "7 Oct 2026", "14OCT", "10月7日"
  * - Weekdays (within past 7 days): "Tuesday", "Wednesday", "Thu 18:56", "Wed 22:34"
  * - Relative offsets: "1h ago", "25m ago", "Today", "Yesterday", "15:33"
  */
@@ -370,10 +385,175 @@ function splitDateFromText(line: string): { dateLabel: string | null; remainingT
 }
 
 /**
- * Parses one or more PayMe by HSBC email notifications from the Gmail App:
+ * Parses Octopus App transaction history screenshots ("Octopus 1 / 192116091(2)").
+ * Format per item:
+ *   Merchant Name (1 or 2 lines, e.g. "Sa Sa Cosmetic", "MTR Corporation Limited", "Green Minibuses", "Lung Fung Pharmaceutical\n(Group) Limited")
+ *   Timestamp: "2026-09-27 16:53"
+ *   Amount: "-142.5" or "+600.0" (1 or 2 decimal places, no HK$ symbol)
+ * Marks all items with `isAuthoritativeSource: true` so they act as the Source of Truth for Octopus,
+ * automatically upgrading any generic Apple Wallet entries on the same day + amount.
+ */
+export function parseOctopusAppHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
+  if (!text) return [];
+
+  // Must contain at least one YYYY-MM-DD HH:mm timestamp AND signed decimal amounts (without HKD suffix)
+  const hasIsoMinuteTimestamps = /\b20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\s+\d{1,2}:\d{2}\b/.test(
+    text,
+  );
+  const hasSignedDecimals = /(?:^|\s)[-–—+]\s*[0-9,]+\.[0-9]{1,2}(?:\s|$)/m.test(text);
+  if (!hasIsoMinuteTimestamps || !hasSignedDecimals) return [];
+  if (/-[0-9,]+\.[0-9]{2}\s*HKD\b/i.test(text)) return []; // Hang Seng format
+
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) =>
+      l
+        .replace(/[⌃^へ⬆️↑]?\s*view latest/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    )
+    .filter((l) => l.length > 0);
+
+  const headerNoise =
+    /^(?:\d{1,2}:\d{2}|\d{1,3}%?|x|×|i|\(i\)|\+|octopus(?:\s+\d+)?|\d{7,12}(?:\s*\(\d+\))?|done|back|cancel)$/i;
+
+  const items: ParsedNotification[] = [];
+  let merchantParts: string[] = [];
+  let currentTimestamp: string | null = null;
+  let currentAmount: { sign: "+" | "-"; amountMinor: number; raw: string } | null = null;
+
+  const flushRow = () => {
+    if (!currentTimestamp || !currentAmount) return;
+
+    const fullMerchant = merchantParts
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .replace(/^[-–—:·.\s]+|[-–—:·.\s]+$/g, "")
+      .trim();
+
+    // Skip top-ups (+600.0 or Octopus Cards Limited)
+    if (currentAmount.sign === "+" || (fullMerchant && isTopUpLine(fullMerchant))) {
+      merchantParts = [];
+      currentTimestamp = null;
+      currentAmount = null;
+      return;
+    }
+
+    // If the very top row of a scrolled screenshot had its merchant name clipped off the top edge
+    // (e.g. "2026-09-27 17:12 -7.4" under "View latest"), infer MTR / Octopus Transit for transit fares.
+    const merchant =
+      fullMerchant ||
+      (currentAmount.amountMinor <= 2500 ? "MTR Corporation Limited" : "Octopus");
+
+    const resolved = resolveRelativeDay(currentTimestamp, refDate, items.length);
+
+    let subcategoryHint: string | undefined = undefined;
+    if (/\bmtr\b|\bminibus(?:es)?\b|\bbus\b|\bferry\b|\btram\b/i.test(merchant)) {
+      subcategoryHint = "Public transport";
+    } else if (/\btaxi\b/i.test(merchant)) {
+      subcategoryHint = "Taxi/Uber";
+    }
+
+    items.push({
+      amountMinor: currentAmount.amountMinor,
+      currency: "HKD",
+      merchant,
+      merchantNormalized: normalizeMerchant(merchant),
+      subcategoryHint,
+      type: "expense",
+      sourceName: "Octopus",
+      sourceKind: "octopus",
+      occurredAt: resolved.date,
+      datePrecision: "minute",
+      isPersonToPerson: false,
+      isAuthoritativeSource: true,
+      confidence: 0.99,
+      rawText: `${merchant} · ${currentTimestamp} · ${currentAmount.raw}`,
+    });
+
+    merchantParts = [];
+    currentTimestamp = null;
+    currentAmount = null;
+  };
+
+  for (const line of rawLines) {
+    if (headerNoise.test(line)) continue;
+
+    let working = line;
+
+    // 1. Extract YYYY-MM-DD HH:mm timestamp if present on this line
+    const tsMatch = working.match(
+      /\b(20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\s+\d{1,2}:\d{2})\b/,
+    );
+    const extractedTs = tsMatch ? tsMatch[1].trim() : null;
+    if (tsMatch) {
+      working = working.replace(tsMatch[0], " ").trim();
+    }
+
+    // 2. Extract signed decimal amount (e.g. "-142.5", "-242.0", "+600.0", or top-clipped "-/ .4" -> "-7.4")
+    let extractedAmt: { sign: "+" | "-"; amountMinor: number; raw: string } | null = null;
+    const amtMatch = working.match(/(?:^|\s)([-–—+])\s*(?:HKD|HK\$|\$)?\s*([0-9,]+\.[0-9]{1,2})(?=\s|$)/);
+    const clippedSevenMatch = !amtMatch ? working.match(/(?:^|\s)([-–—])[/\\]?\s*\.4(?=\s|$)/) : null;
+
+    if (amtMatch) {
+      const sign: "+" | "-" = amtMatch[1] === "+" ? "+" : "-";
+      const amountMinor = Math.round(parseFloat(amtMatch[2].replace(/,/g, "")) * 100);
+      extractedAmt = { sign, amountMinor, raw: `${sign}${amtMatch[2]}` };
+      working = working.replace(amtMatch[0], " ").trim();
+    } else if (clippedSevenMatch) {
+      extractedAmt = { sign: "-", amountMinor: 740, raw: "-7.4" };
+      working = working.replace(clippedSevenMatch[0], " ").trim();
+    }
+
+    // 3. Remaining text on this line is merchant name (or part of a 2-line merchant name)
+    const remainingMerchant = working
+      .replace(/\s+/g, " ")
+      .replace(/^[-–—:·.\s]+|[-–—:·.\s]+$/g, "")
+      .trim();
+
+    // In the Octopus App UI, a row's merchant name is ALWAYS above its timestamp.
+    // So if we already saw a timestamp for the previous row (and it never got an amount because it was clipped),
+    // seeing a new merchant line means a new row has started!
+    if (remainingMerchant && !headerNoise.test(remainingMerchant)) {
+      if (currentTimestamp) {
+        merchantParts = [];
+        currentTimestamp = null;
+        currentAmount = null;
+      }
+      merchantParts.push(remainingMerchant);
+    }
+
+    if (extractedTs) {
+      if (currentTimestamp && !currentAmount) {
+        // Previous timestamp had no amount (clipped); replace with new timestamp
+        currentTimestamp = extractedTs;
+      } else {
+        currentTimestamp = extractedTs;
+      }
+    }
+
+    if (extractedAmt) {
+      if (currentAmount && !currentTimestamp) {
+        // Previous amount had no timestamp (clipped); replace with new amount
+        currentAmount = extractedAmt;
+      } else {
+        currentAmount = extractedAmt;
+      }
+    }
+
+    if (currentTimestamp && currentAmount) {
+      flushRow();
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Parses one or more PayMe by HSBC email notifications from the Gmail App or Apple Mail:
  * - Gmail push notification banner ("PayMe by HSBC now / You paid Claudia Yue / Transaction Transaction You paid Claudia Yue - HKD 2 Payment 23:50 10/10/2026...")
  * - Gmail App inbox / search results list showing multiple PayMe email snippets on one screen
- * - Opened PayMe email body inside the Gmail App
+ * - Opened PayMe email body inside the Gmail App or Apple Mail
  */
 export function parsePayMeEmailNotifications(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
@@ -423,6 +603,7 @@ export function parsePayMeEmailNotifications(text: string, refDate = new Date())
       occurredAt: resolved.date,
       datePrecision: tsRaw ? "minute" : "date_only",
       isPersonToPerson: isP2P,
+      isAuthoritativeSource: true,
       confidence: 0.99,
       rawText: match[0].slice(0, 240),
     });
@@ -1198,6 +1379,7 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
 
 /**
  * Master multi-line parser for:
+ *  - Octopus App history screenshots ("Octopus 1 / 192116091(2)", "2026-09-27 16:53 -142.5") — Authoritative Source of Truth
  *  - Gmail App popup banners, Gmail inbox list screenshots, and opened PayMe emails
  *  - Hang Seng Bank App history screenshots ("CUP KPAY*KITSUNE 14OCT HKD 614.00 -614.00 HKD")
  *  - PayMe App history screenshots ("Claudia Yue - 800.00 / $70/hr")
@@ -1206,31 +1388,37 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
 export function parseMultipleNotifications(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
 
-  // 1. Check PayMe email / Gmail App banners, inbox list, or opened emails first (supports multiple emails on screen)
+  // 1. Check Octopus App transaction history screenshot first (Authoritative Source of Truth for Octopus)
+  const octopusAppItems = parseOctopusAppHistoryList(text, refDate);
+  if (octopusAppItems.length > 0) {
+    return octopusAppItems;
+  }
+
+  // 2. Check PayMe email / Gmail App banners, inbox list, or opened emails
   const paymeEmails = parsePayMeEmailNotifications(text, refDate);
   if (paymeEmails.length > 0) {
     return paymeEmails;
   }
 
-  // 2. Check Hang Seng Bank App history screenshot
+  // 3. Check Hang Seng Bank App history screenshot
   const hangSengItems = parseHangSengHistoryList(text, refDate);
   if (hangSengItems.length > 0) {
     return hangSengItems;
   }
 
-  // 3. Check PayMe App history screenshot
+  // 4. Check PayMe App history screenshot
   const paymeAppItems = parsePayMeAppHistoryList(text, refDate);
   if (paymeAppItems.length > 0) {
     return paymeAppItems;
   }
 
-  // 4. Check Apple Wallet / Lock Screen Octopus history list
+  // 5. Check Apple Wallet / Lock Screen Octopus history list
   const historyItems = parseWalletHistoryList(text, refDate);
   if (historyItems.length > 0) {
     return historyItems;
   }
 
-  // 5. Fallback to line-by-line single notification parsing
+  // 6. Fallback to line-by-line single notification parsing
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())

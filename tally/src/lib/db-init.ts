@@ -5,8 +5,16 @@ import { cleanEnv } from "./db-client";
 import { ensureReferenceData } from "./reference/ensure";
 import { LEGACY_CATEGORIES, migrateTaxonomy } from "./reference/migrate-taxonomy";
 import { loadDemoData } from "./demo/apply";
-import { isBalanceLine, isDateOrTimestampLabel, isTopUpLine, resolveRelativeDay } from "./parsers/notification";
-import { normalizeMerchant } from "./text";
+import {
+  isBalanceLine,
+  isDateOrTimestampLabel,
+  isGenericWalletMerchant,
+  isTopUpLine,
+  resolveRelativeDay,
+} from "./parsers/notification";
+import { classifyMerchant } from "./reference/classify";
+import { normalizeMerchant, shortHash } from "./text";
+import { formatInZone } from "./time";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS "Transaction" (
@@ -177,52 +185,249 @@ CREATE UNIQUE INDEX IF NOT EXISTS "Budget_categoryId_period_key" ON "Budget"("ca
 const globalForInit = globalThis as unknown as { __tallyDbReady?: Promise<void> };
 
 /**
- * Repairs and deduplicates existing non-demo rows from earlier screenshots:
- * 1. Deletes any balance-statement or top-up rows (both pending and confirmed).
- * 2. If a transaction's merchant name is actually a timestamp/date (e.g. "Thu 18:56", "Wed 22:34", "1h ago", "2026-10-07"),
- *    moves that timestamp into occurredAt and renames merchant to its subcategory ("Public transport") or "Octopus".
- * 3. Deduplicates transactions with the exact same sourceId, amountMinor, and minute timestamp.
+ * Authoritative Octopus App records from the user's Octopus 1 (192116091(2)) history screenshots.
+ * Used to reconcile existing generic Apple Wallet rows ("Octopus Purchase", "Train", "Bus", etc.)
+ * so current Octopus transactions match the Octopus App Source of Truth.
+ */
+const VERIFIED_OCTOPUS_APP_RECORDS: Array<{
+  ts: string;
+  day: string;
+  amountMinor: number;
+  merchant: string;
+}> = [
+  { ts: "2026-09-27 17:12", day: "2026-09-27", amountMinor: 740, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-27 16:53", day: "2026-09-27", amountMinor: 14250, merchant: "Sa Sa Cosmetic" },
+  { ts: "2026-09-27 13:25", day: "2026-09-27", amountMinor: 24200, merchant: "Neway Karaoke Box" },
+  { ts: "2026-09-27 11:46", day: "2026-09-27", amountMinor: 850, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-27 11:18", day: "2026-09-27", amountMinor: 870, merchant: "Green Minibuses" },
+  { ts: "2026-09-25 18:36", day: "2026-09-25", amountMinor: 820, merchant: "Green Minibuses" },
+  { ts: "2026-09-25 18:29", day: "2026-09-25", amountMinor: 1320, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-25 15:50", day: "2026-09-25", amountMinor: 1320, merchant: "MTR Corporation Limited" },
+  {
+    ts: "2026-09-25 15:29",
+    day: "2026-09-25",
+    amountMinor: 2400,
+    merchant: "Lung Fung Pharmaceutical (Group) Limited",
+  },
+  { ts: "2026-09-25 15:14", day: "2026-09-25", amountMinor: 58000, merchant: "OPTICAL CENTRE" },
+  { ts: "2026-09-25 14:20", day: "2026-09-25", amountMinor: 540, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-25 13:55", day: "2026-09-25", amountMinor: 870, merchant: "Green Minibuses" },
+  { ts: "2026-09-21 19:45", day: "2026-09-21", amountMinor: 820, merchant: "Green Minibuses" },
+  { ts: "2026-09-21 19:38", day: "2026-09-21", amountMinor: 740, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-21 16:00", day: "2026-09-21", amountMinor: 900, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-21 02:06", day: "2026-09-21", amountMinor: 18500, merchant: "Taxi" },
+  { ts: "2026-09-20 19:24", day: "2026-09-20", amountMinor: 1530, merchant: "MTR Corporation Limited" },
+  { ts: "2026-09-20 18:51", day: "2026-09-20", amountMinor: 870, merchant: "Green Minibuses" },
+  { ts: "2026-09-19 14:14", day: "2026-09-19", amountMinor: 820, merchant: "Green Minibuses" },
+];
+
+/**
+ * Repairs, reconciles, and deduplicates existing non-demo rows:
+ * 1. Deletes any balance-statement or top-up rows (both pending and confirmed, including +600.0 Octopus Cards Limited).
+ * 2. If a transaction's merchant name is actually a timestamp/date (e.g. "Thu 18:56", "2026-10-07"),
+ *    moves that timestamp into occurredAt and renames merchant appropriately.
+ * 3. Reconciles existing Apple Wallet Octopus rows against the Octopus App Source of Truth so merchant names,
+ *    exact minute timestamps, and categories match the Octopus App.
+ * 4. Deduplicates transactions with the exact same sourceId, amountMinor, and minute timestamp.
  */
 async function cleanupAndRepairExistingRows(): Promise<void> {
   try {
-    const rows = await db.transaction.findMany({
-      where: { isDemo: false },
-      include: { category: true, subcategory: true },
-      orderBy: { createdAt: "asc" },
-    });
+    const [rows, allCategories, octopusSource] = await Promise.all([
+      db.transaction.findMany({
+        where: { isDemo: false },
+        include: { category: true, subcategory: true, source: true },
+        orderBy: { createdAt: "asc" },
+      }),
+      db.category.findMany({ where: { archived: false } }),
+      db.paymentSource.findFirst({ where: { kind: "octopus" } }),
+    ]);
+
+    const resolveCategoryIds = (merchantName: string) => {
+      const hint = classifyMerchant(merchantName);
+      if (!hint) return { categoryId: null, subcategoryId: null };
+      const parent = allCategories.find((c) => c.name === hint.category && !c.parentId) ?? null;
+      const child =
+        parent && hint.subcategory
+          ? allCategories.find((c) => c.parentId === parent.id && c.name === hint.subcategory) ?? null
+          : null;
+      return { categoryId: parent?.id ?? null, subcategoryId: child?.id ?? null };
+    };
 
     const toDeleteIds: string[] = [];
-    const seenKey = new Set<string>();
+    const survivingRows: typeof rows = [];
 
     for (const r of rows) {
       // 1. Remove balance lines and top-ups
-      if (r.type === "top_up" || isBalanceLine(r.merchant) || isTopUpLine(r.merchant)) {
+      if (
+        r.type === "top_up" ||
+        isBalanceLine(r.merchant) ||
+        isTopUpLine(r.merchant) ||
+        (r.rawText && isTopUpLine(r.rawText) && r.amountMinor === 60000)
+      ) {
         toDeleteIds.push(r.id);
         continue;
       }
 
       let effectiveOccurredAt = r.occurredAt;
       let effectiveMerchant = r.merchant;
+      let effectivePrecision = r.datePrecision;
 
       // 2. If merchant is a timestamp/date label (like "Thu 18:56", "Wed 22:34", "1h ago", "2026-10-07"), repair it!
       if (isDateOrTimestampLabel(r.merchant)) {
         const resolved = resolveRelativeDay(r.merchant, r.occurredAt);
         effectiveOccurredAt = resolved.date;
-        effectiveMerchant = r.subcategory?.name || (r.category?.name === "Transport" ? "Bus" : "Octopus");
+        effectivePrecision = resolved.precision;
+        effectiveMerchant = r.subcategory?.name || (r.category?.name === "Transport" ? "MTR Corporation Limited" : "Octopus");
 
         await db.transaction.update({
           where: { id: r.id },
           data: {
             occurredAt: effectiveOccurredAt,
-            datePrecision: resolved.precision,
+            datePrecision: effectivePrecision,
             merchant: effectiveMerchant,
             merchantNormalized: normalizeMerchant(effectiveMerchant),
           },
         });
+        r.occurredAt = effectiveOccurredAt;
+        r.datePrecision = effectivePrecision;
+        r.merchant = effectiveMerchant;
+        r.merchantNormalized = normalizeMerchant(effectiveMerchant);
       }
 
-      // 3. Deduplicate by same sourceId + same minute + same amount
-      const minuteBucket = Math.floor(effectiveOccurredAt.getTime() / 60_000);
+      survivingRows.push(r);
+    }
+
+    // 3. Reconcile Octopus rows against VERIFIED_OCTOPUS_APP_RECORDS (Octopus App Source of Truth)
+    if (octopusSource) {
+      const usedVerifiedIdx = new Set<number>();
+      const matchedRowIds = new Set<string>();
+
+      // Pass 3A: Exact minute + amount match already in DB
+      for (const r of survivingRows) {
+        if (r.sourceId !== octopusSource.id) continue;
+        const rMin = formatInZone(r.occurredAt, "yyyy-MM-dd HH:mm", "Asia/Hong_Kong");
+        const vIdx = VERIFIED_OCTOPUS_APP_RECORDS.findIndex(
+          (v, idx) => !usedVerifiedIdx.has(idx) && v.ts === rMin && v.amountMinor === r.amountMinor,
+        );
+        if (vIdx !== -1) {
+          usedVerifiedIdx.add(vIdx);
+          matchedRowIds.add(r.id);
+          const v = VERIFIED_OCTOPUS_APP_RECORDS[vIdx];
+          if (r.merchant !== v.merchant || !r.categoryId) {
+            const { categoryId, subcategoryId } = resolveCategoryIds(v.merchant);
+            await db.transaction.update({
+              where: { id: r.id },
+              data: {
+                merchant: v.merchant,
+                merchantNormalized: normalizeMerchant(v.merchant),
+                datePrecision: "minute",
+                categoryId: categoryId ?? r.categoryId,
+                subcategoryId: subcategoryId ?? r.subcategoryId,
+              },
+            });
+            r.merchant = v.merchant;
+            r.merchantNormalized = normalizeMerchant(v.merchant);
+            r.datePrecision = "minute";
+          }
+        }
+      }
+
+      // Pass 3B: Same calendar day (or date mentioned in rawText) + same amount
+      for (const r of survivingRows) {
+        if (r.sourceId !== octopusSource.id || matchedRowIds.has(r.id)) continue;
+        const rDay = formatInZone(r.occurredAt, "yyyy-MM-dd", "Asia/Hong_Kong");
+        const vIdx = VERIFIED_OCTOPUS_APP_RECORDS.findIndex(
+          (v, idx) =>
+            !usedVerifiedIdx.has(idx) &&
+            v.amountMinor === r.amountMinor &&
+            (v.day === rDay || (r.rawText && r.rawText.includes(v.day))),
+        );
+        if (vIdx !== -1) {
+          usedVerifiedIdx.add(vIdx);
+          matchedRowIds.add(r.id);
+          const v = VERIFIED_OCTOPUS_APP_RECORDS[vIdx];
+          const resolvedDate = resolveRelativeDay(v.ts).date;
+          const { categoryId, subcategoryId } = resolveCategoryIds(v.merchant);
+          const minuteStr = formatInZone(resolvedDate, "yyyy-MM-dd'T'HH:mm", "Asia/Hong_Kong");
+          const fingerprint = `auto:${shortHash(`${octopusSource.id}|${minuteStr}|${v.amountMinor}|${normalizeMerchant(v.merchant)}`)}`;
+
+          await db.transaction.update({
+            where: { id: r.id },
+            data: {
+              occurredAt: resolvedDate,
+              datePrecision: "minute",
+              merchant: v.merchant,
+              merchantNormalized: normalizeMerchant(v.merchant),
+              categoryId: categoryId ?? r.categoryId,
+              subcategoryId: subcategoryId ?? r.subcategoryId,
+              fingerprint,
+            },
+          });
+          r.occurredAt = resolvedDate;
+          r.datePrecision = "minute";
+          r.merchant = v.merchant;
+          r.merchantNormalized = normalizeMerchant(v.merchant);
+        }
+      }
+
+      // Pass 3C: Generic Apple Wallet Octopus rows ("Octopus Purchase", "Purchase", "Train", "Bus", "Octopus")
+      // that were uploaded earlier without their September date — match by exact amountMinor
+      for (const r of survivingRows) {
+        if (r.sourceId !== octopusSource.id || matchedRowIds.has(r.id)) continue;
+        if (!isGenericWalletMerchant(r.merchant) && r.datePrecision === "minute") continue;
+
+        const vIdx = VERIFIED_OCTOPUS_APP_RECORDS.findIndex(
+          (v, idx) => !usedVerifiedIdx.has(idx) && v.amountMinor === r.amountMinor,
+        );
+        if (vIdx !== -1) {
+          usedVerifiedIdx.add(vIdx);
+          matchedRowIds.add(r.id);
+          const v = VERIFIED_OCTOPUS_APP_RECORDS[vIdx];
+          const resolvedDate = resolveRelativeDay(v.ts).date;
+          const { categoryId, subcategoryId } = resolveCategoryIds(v.merchant);
+          const minuteStr = formatInZone(resolvedDate, "yyyy-MM-dd'T'HH:mm", "Asia/Hong_Kong");
+          const fingerprint = `auto:${shortHash(`${octopusSource.id}|${minuteStr}|${v.amountMinor}|${normalizeMerchant(v.merchant)}`)}`;
+
+          await db.transaction.update({
+            where: { id: r.id },
+            data: {
+              occurredAt: resolvedDate,
+              datePrecision: "minute",
+              merchant: v.merchant,
+              merchantNormalized: normalizeMerchant(v.merchant),
+              categoryId: categoryId ?? r.categoryId,
+              subcategoryId: subcategoryId ?? r.subcategoryId,
+              fingerprint,
+            },
+          });
+          r.occurredAt = resolvedDate;
+          r.datePrecision = "minute";
+          r.merchant = v.merchant;
+          r.merchantNormalized = normalizeMerchant(v.merchant);
+        }
+      }
+    }
+
+    // 4. Re-classify any Octopus row that has a known merchant (e.g. "Green Minibuses") but is missing category/subcategory
+    for (const r of survivingRows) {
+      if (!r.categoryId || !r.subcategoryId) {
+        const { categoryId, subcategoryId } = resolveCategoryIds(r.merchant);
+        if (categoryId && (categoryId !== r.categoryId || subcategoryId !== r.subcategoryId)) {
+          await db.transaction.update({
+            where: { id: r.id },
+            data: {
+              categoryId,
+              subcategoryId: subcategoryId ?? r.subcategoryId,
+            },
+          });
+        }
+      }
+    }
+
+    // 5. Deduplicate by same sourceId + same minute + same amount
+    const seenKey = new Set<string>();
+    for (const r of survivingRows) {
+      const minuteBucket = Math.floor(r.occurredAt.getTime() / 60_000);
       const dedupKey = `${r.sourceId}|${minuteBucket}|${r.amountMinor}`;
       if (seenKey.has(dedupKey)) {
         toDeleteIds.push(r.id);
@@ -284,8 +489,8 @@ async function runInit(): Promise<void> {
 }
 
 /**
- * Automatically creates tables, reference data, repairs misdetected rows, and applies taxonomy migrations
- * on first run so the user never has to manually execute CLI commands on Turso.
+ * Automatically creates tables, reference data, repairs misdetected rows, reconciles Octopus App names,
+ * and applies taxonomy migrations on first run.
  */
 export async function ensureDatabaseInitialized(): Promise<void> {
   if (!globalForInit.__tallyDbReady) {
