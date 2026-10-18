@@ -12,7 +12,7 @@ export type CategorySeed = {
 
 export const CATEGORY_SEEDS: CategorySeed[] = [
   { name: "Transport", color: "blue", ambiguous: false, children: ["Public transport", "Taxi/Uber", "Other transport"] },
-  { name: "Food", color: "orange", ambiguous: true, children: ["Restaurant", "Cafe", "Fast food", "Food delivery", "Bakery"] },
+  { name: "Food", color: "orange", ambiguous: true, children: ["Restaurant", "Cafe", "Fast food", "Food delivery", "Bakery", "Dessert"] },
   { name: "Gathering", color: "purple", ambiguous: true, children: ["Group meal", "Drinks & desserts", "Gathering activity"] },
   { name: "Groceries", color: "green", ambiguous: false, children: ["Supermarket", "Convenience store", "Wet market"] },
   { name: "Gift", color: "red", ambiguous: true, children: ["Gift", "Red packet"] },

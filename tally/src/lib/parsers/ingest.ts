@@ -49,14 +49,42 @@ const GENERIC_WALLET_MERCHANTS = [
   "付款",
 ];
 
+const GENERIC_RULE_BLACKLIST = new Set([
+  "octopus",
+  "octopus 1",
+  "octopus 2",
+  "octopus purchase",
+  "purchase",
+  "payme",
+  "hang seng",
+  "hang seng card",
+  "visa",
+  "mastercard",
+  "八達通",
+]);
+
 /**
- * Strips leading OCR icon misreads (e.g. "印 Green Minibuses" -> "Green Minibuses", "印 MTR Corporation Limited" -> "MTR Corporation Limited").
+ * Strips Octopus App card header/account numbers (e.g. "< Octopus 1 192116091(2)")
+ * and leading OCR icon misreads (e.g. "印 Green Minibuses" -> "Green Minibuses").
  */
 function cleanOcrMerchantName(input: string): string {
   if (!input) return "";
   return input
     .normalize("NFKC")
-    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /(?:^|\s)[<‹＜«←⬅️⌃^]*\s*(?:octopus|八達通)(?:\s+\d+)?\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/gi,
+      " ",
+    )
+    .replace(
+      /^[<‹＜«←⬅️]+\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/i,
+      "",
+    )
+    .replace(
+      /^(?:octopus|八達通)\s+\d+(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?(?:\s+|$)/i,
+      "",
+    )
+    .replace(/(?:^|\s)[<‹＜«←⬅️]*\s*\b\d{7,12}\s*[\(\[\{]\d+[\)\]\}]?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/g, " ")
+    .replace(/^[<‹＜«←⬅️•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
     .replace(
       /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
       "",
@@ -81,6 +109,8 @@ function cleanMerchantForSearch(merchant: string): string {
 
 function canonicalizeMerchantKey(input: string): string {
   return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s+\d+)?)?\s*/i, "")
+    .replace(/\b\d{7,12}\b/g, " ")
     .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
     .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
     .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
@@ -94,13 +124,17 @@ function canonicalizeMerchantKey(input: string): string {
 function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
   const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
   const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
-  if (!normMerchant || !normRule) return false;
+  if (!normMerchant || !normRule || normRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(normMerchant) || GENERIC_RULE_BLACKLIST.has(normRule)) return false;
+
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule || canonRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(canonMerchant) || GENERIC_RULE_BLACKLIST.has(canonRule)) return false;
+
   if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
     return true;
   }
-  const canonMerchant = canonicalizeMerchantKey(merchant);
-  const canonRule = canonicalizeMerchantKey(rulePattern);
-  if (!canonMerchant || !canonRule) return false;
   return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
 }
 
@@ -120,6 +154,14 @@ function scoreWebTextForCategory(webText: string): ExtendedClassification | null
         [/\bpatisserie\b|\bboulangerie\b|\bbakery\b|\bbakehouse\b/g, 5],
         [/\bcake\b|\bpastry\b|\bpastries\b|\bcroissant\b|\btart\b|\bmacaron\b|\bbread\b|\bsourdough\b/g, 3],
         [/麵包|餅店|西餅|蛋糕|烘焙/g, 5],
+      ],
+    },
+    {
+      category: "Food",
+      subcategory: "Dessert",
+      keywords: [
+        [/\bdessert\b|\bdessert shop\b|\bsweet soup\b|\bshaved ice\b|\bkakigori\b|\bgelato\b|\bice cream\b|\bfrozen yogurt\b|\bfroyo\b|\bwaffle\b|\bcrepe\b|\bsouffle\b|\btiramisu\b|\bpudding\b/g, 5],
+        [/甜品|糖水|雪糕|刨冰|豆腐花|芋圓|仙草/g, 5],
       ],
     },
     {
@@ -163,8 +205,8 @@ function scoreWebTextForCategory(webText: string): ExtendedClassification | null
       category: "Gathering",
       subcategory: "Drinks & desserts",
       keywords: [
-        [/\bcocktail bar\b|\bwine bar\b|\bcraft beer\b|\bpub\b|\btaproom\b|\bspeakeasy\b|\bdessert shop\b|\bshaved ice\b|\bgelato\b/g, 4],
-        [/酒吧|甜品|糖水/g, 4],
+        [/\bcocktail bar\b|\bwine bar\b|\bcraft beer\b|\bpub\b|\btaproom\b|\bspeakeasy\b/g, 4],
+        [/酒吧/g, 4],
       ],
     },
     {
@@ -328,7 +370,7 @@ async function searchAndClassifyMerchant(merchant: string): Promise<ExtendedClas
 Merchant: "${cleaned}" (raw: "${merchant}")
 Choose exactly ONE category and subcategory from this list:
 - Transport: Public transport | Taxi/Uber | Other transport
-- Food: Restaurant | Cafe | Fast food | Food delivery | Bakery
+- Food: Restaurant | Cafe | Fast food | Food delivery | Bakery | Dessert
 - Gathering: Group meal | Drinks & desserts | Gathering activity
 - Groceries: Supermarket | Convenience store | Wet market
 - Gift: Gift | Red packet
@@ -442,7 +484,15 @@ export async function ingestNotificationRecord(
     };
   }
 
-  parsed.merchant = cleanOcrMerchantName(parsed.merchant) || parsed.merchant;
+  const cleanedMerchant = cleanOcrMerchantName(parsed.merchant);
+  if (!cleanedMerchant) {
+    return {
+      ok: true,
+      isDuplicate: true,
+      message: "Skipped Octopus card header line.",
+    };
+  }
+  parsed.merchant = cleanedMerchant;
   parsed.merchantNormalized = normalizeMerchant(parsed.merchant);
 
   if (parsed.type === "top_up" || isTopUpLine(parsed.merchant) || isBalanceLine(parsed.merchant)) {
@@ -530,8 +580,8 @@ export async function ingestNotificationRecord(
   }
 
   if (learnedFromWebSearch && !hint?.isKeywordFallback && (subcategoryId || categoryId)) {
-    const cleanPattern = cleanMerchantForSearch(parsed.merchant).toLowerCase().trim();
-    if (cleanPattern.length >= 3) {
+    const cleanPattern = canonicalizeMerchantKey(parsed.merchant) || cleanMerchantForSearch(parsed.merchant).toLowerCase().trim();
+    if (cleanPattern.length >= 3 && !GENERIC_RULE_BLACKLIST.has(cleanPattern)) {
       const existingRule = rules.find((r) => doesMerchantMatchRule(cleanPattern, r.pattern));
       if (!existingRule) {
         await db.merchantRule

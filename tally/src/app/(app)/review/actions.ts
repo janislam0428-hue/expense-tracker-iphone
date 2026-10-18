@@ -8,11 +8,38 @@ import { demoScope, getSettings } from "@/lib/settings";
 import { normalizeMerchant } from "@/lib/text";
 import { zonedDate } from "@/lib/time";
 
+const GENERIC_RULE_BLACKLIST = new Set([
+  "octopus",
+  "octopus 1",
+  "octopus 2",
+  "octopus purchase",
+  "purchase",
+  "payme",
+  "hang seng",
+  "hang seng card",
+  "visa",
+  "mastercard",
+  "八達通",
+]);
+
 function cleanOcrMerchantName(input: string): string {
   if (!input) return "";
   return input
     .normalize("NFKC")
-    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /(?:^|\s)[<‹＜«←⬅️⌃^]*\s*(?:octopus|八達通)(?:\s+\d+)?\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/gi,
+      " ",
+    )
+    .replace(
+      /^[<‹＜«←⬅️]+\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/i,
+      "",
+    )
+    .replace(
+      /^(?:octopus|八達通)\s+\d+(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?(?:\s+|$)/i,
+      "",
+    )
+    .replace(/(?:^|\s)[<‹＜«←⬅️]*\s*\b\d{7,12}\s*[\(\[\{]\d+[\)\]\}]?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/g, " ")
+    .replace(/^[<‹＜«←⬅️•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
     .replace(
       /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
       "",
@@ -23,6 +50,8 @@ function cleanOcrMerchantName(input: string): string {
 
 function canonicalizeMerchantKey(input: string): string {
   return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s+\d+)?)?\s*/i, "")
+    .replace(/\b\d{7,12}\b/g, " ")
     .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
     .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
     .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
@@ -36,13 +65,17 @@ function canonicalizeMerchantKey(input: string): string {
 function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
   const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
   const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
-  if (!normMerchant || !normRule) return false;
+  if (!normMerchant || !normRule || normRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(normMerchant) || GENERIC_RULE_BLACKLIST.has(normRule)) return false;
+
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule || canonRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(canonMerchant) || GENERIC_RULE_BLACKLIST.has(canonRule)) return false;
+
   if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
     return true;
   }
-  const canonMerchant = canonicalizeMerchantKey(merchant);
-  const canonRule = canonicalizeMerchantKey(rulePattern);
-  if (!canonMerchant || !canonRule) return false;
   return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
 }
 
@@ -158,84 +191,92 @@ export async function confirmPurpose(data: {
 
       if ((data.saveRule || data.ruleOnly) && updatedMerchantNormalized && categoryId) {
         const rulePattern = canonicalizeMerchantKey(updatedMerchant) || updatedMerchantNormalized;
-        const existingRules = await db.merchantRule.findMany({
-          where: { isDemo: tx.isDemo },
-        });
-        const existingRule = existingRules.find(
-          (r) => r.pattern.toLowerCase().trim() === rulePattern || doesMerchantMatchRule(updatedMerchant, r.pattern),
-        );
+        if (rulePattern.length >= 2 && !GENERIC_RULE_BLACKLIST.has(rulePattern)) {
+          const existingRules = await db.merchantRule?.findMany
+            ? await db.merchantRule.findMany({ where: { isDemo: tx.isDemo } })
+            : [];
+          const existingRule =
+            existingRules.find(
+              (r) => r.pattern.toLowerCase().trim() === rulePattern || doesMerchantMatchRule(updatedMerchant, r.pattern),
+            ) ??
+            (await db.merchantRule.findFirst?.({
+              where: { pattern: rulePattern, isDemo: tx.isDemo },
+            }));
 
-        if (!existingRule) {
-          await db.merchantRule.create({
-            data: {
-              pattern: rulePattern,
-              matchType: "contains",
-              categoryId: subcategoryId ?? categoryId,
-              purposeId: resolvedPurposeId,
-              hits: 1,
-              lastUsedAt: new Date(),
-              isDemo: tx.isDemo,
-            },
-          });
-        } else {
-          await db.merchantRule.update({
-            where: { id: existingRule.id },
-            data: {
-              pattern: rulePattern,
-              categoryId: subcategoryId ?? categoryId,
-              ...(resolvedPurposeId ? { purposeId: resolvedPurposeId } : {}),
-              hits: { increment: 1 },
-              lastUsedAt: new Date(),
-            },
-          });
-        }
+          if (!existingRule) {
+            await db.merchantRule.create({
+              data: {
+                pattern: rulePattern,
+                matchType: "contains",
+                categoryId: subcategoryId ?? categoryId,
+                purposeId: resolvedPurposeId,
+                hits: 1,
+                lastUsedAt: new Date(),
+                isDemo: tx.isDemo,
+              },
+            });
+          } else {
+            await db.merchantRule.update({
+              where: { id: existingRule.id },
+              data: {
+                pattern: rulePattern,
+                categoryId: subcategoryId ?? categoryId,
+                ...(resolvedPurposeId ? { purposeId: resolvedPurposeId } : {}),
+                hits: { increment: 1 },
+                lastUsedAt: new Date(),
+              },
+            });
+          }
 
-        const otherTransactions = await db.transaction.findMany({
-          where: {
-            isDemo: tx.isDemo,
-            id: { not: data.transactionId },
-          },
-          select: {
-            id: true,
-            merchant: true,
-            purposeStatus: true,
-            amountMinor: true,
-            counterparty: true,
-          },
-        });
+          if (typeof db.transaction.findMany === "function") {
+            const otherTransactions = await db.transaction.findMany({
+              where: {
+                isDemo: tx.isDemo,
+                id: { not: data.transactionId },
+              },
+              select: {
+                id: true,
+                merchant: true,
+                purposeStatus: true,
+                amountMinor: true,
+                counterparty: true,
+              },
+            });
 
-        const matchingOthers = otherTransactions.filter((t) =>
-          doesMerchantMatchRule(t.merchant, rulePattern),
-        );
+            const matchingOthers = (otherTransactions ?? []).filter((t) =>
+              doesMerchantMatchRule(t.merchant, rulePattern),
+            );
 
-        for (const other of matchingOthers) {
-          const cleanOtherMerchant = cleanOcrMerchantName(other.merchant) || other.merchant;
-          const shouldAutoConfirm =
-            !data.ruleOnly &&
-            other.purposeStatus === "needs_review" &&
-            other.amountMinor <= settings.reviewThresholdMinor &&
-            !other.counterparty;
+            for (const other of matchingOthers) {
+              const cleanOtherMerchant = cleanOcrMerchantName(other.merchant) || other.merchant;
+              const shouldAutoConfirm =
+                !data.ruleOnly &&
+                other.purposeStatus === "needs_review" &&
+                other.amountMinor <= (settings.reviewThresholdMinor ?? 50000) &&
+                !other.counterparty;
 
-          await db.transaction.update({
-            where: { id: other.id },
-            data: {
-              merchant: cleanOtherMerchant,
-              merchantNormalized: normalizeMerchant(cleanOtherMerchant),
-              categoryId,
-              subcategoryId,
-              ...(resolvedPurposeId ? { purposeId: resolvedPurposeId } : {}),
-              ...(shouldAutoConfirm
-                ? {
-                    purposeStatus: "confirmed",
-                    reviewReasons: "[]",
-                  }
-                : {}),
-            },
-          });
+              await db.transaction.update({
+                where: { id: other.id },
+                data: {
+                  merchant: cleanOtherMerchant,
+                  merchantNormalized: normalizeMerchant(cleanOtherMerchant),
+                  categoryId,
+                  subcategoryId,
+                  ...(resolvedPurposeId ? { purposeId: resolvedPurposeId } : {}),
+                  ...(shouldAutoConfirm
+                    ? {
+                        purposeStatus: "confirmed",
+                        reviewReasons: "[]",
+                      }
+                    : {}),
+                },
+              });
 
-          autoUpdatedCount++;
-          if (shouldAutoConfirm) {
-            autoConfirmedIds.push(other.id);
+              autoUpdatedCount++;
+              if (shouldAutoConfirm) {
+                autoConfirmedIds.push(other.id);
+              }
+            }
           }
         }
       }
@@ -250,8 +291,8 @@ export async function confirmPurpose(data: {
     }
     return {
       ok: "Confirmed",
-      autoConfirmedIds,
-      autoUpdatedCount,
+      ...(autoConfirmedIds.length > 0 ? { autoConfirmedIds } : {}),
+      ...(autoUpdatedCount > 0 ? { autoUpdatedCount } : {}),
     };
   } catch (err) {
     console.error("Confirm transaction error:", err);

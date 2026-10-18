@@ -49,6 +49,7 @@ export const REVIEW_REASONS = {
   p2p: "PayMe payment to a person",
   p2p_received: "Money received from a person",
   uncategorized: "No category yet",
+  keyword_suggestion: "Suggested from keyword — please confirm or change",
 } as const;
 export type ReviewReason = keyof typeof REVIEW_REASONS;
 
