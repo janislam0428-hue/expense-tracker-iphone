@@ -28,13 +28,14 @@ export default async function ReviewPage() {
     <div className="flex flex-col gap-6">
       <PageHeader
         title="To confirm"
-        description="Transactions where the category isn't obvious or the amount exceeds your review threshold. Small everyday fares are auto-confirmed."
+        description="Transactions where the category isn't obvious or the amount exceeds your review threshold. Small everyday fares and saved rules are auto-confirmed."
       />
       <ReviewInbox
         initialTransactions={rows}
         categories={categories.map((c) => ({
           id: c.id,
           name: c.name,
+          color: c.color,
           children: c.children.map((s) => ({ id: s.id, name: s.name })),
         }))}
         zone={settings.timezone}

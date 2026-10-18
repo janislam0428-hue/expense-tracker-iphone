@@ -13,8 +13,47 @@ import {
   resolveRelativeDay,
 } from "./parsers/notification";
 import { classifyMerchant } from "./reference/classify";
+import { decideReview } from "./review/rules";
 import { normalizeMerchant, shortHash } from "./text";
 import { formatInZone } from "./time";
+
+function cleanOcrMerchantName(input: string): string {
+  if (!input) return "";
+  return input
+    .normalize("NFKC")
+    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalizeMerchantKey(input: string): string {
+  return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
+    .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
+    .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
+    .replace(/\bwel+come\b/g, "wellcome")
+    .replace(/\bminibuses\b/g, "minibus")
+    .replace(/\bbuses\b/g, "bus")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
+  const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
+  const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
+  if (!normMerchant || !normRule) return false;
+  if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
+    return true;
+  }
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule) return false;
+  return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
+}
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS "Transaction" (
@@ -182,13 +221,11 @@ CREATE INDEX IF NOT EXISTS "ImportBatch_rawPayloadHash_idx" ON "ImportBatch"("ra
 CREATE UNIQUE INDEX IF NOT EXISTS "Budget_categoryId_period_key" ON "Budget"("categoryId", "period");
 `;
 
-const globalForInit = globalThis as unknown as { __tallyDbReady?: Promise<void> };
+const globalForInit = globalThis as unknown as {
+  __tallySchemaReady?: Promise<void>;
+  __tallyLastRepairAt?: number;
+};
 
-/**
- * Authoritative Octopus App records from the user's Octopus 1 (192116091(2)) history screenshots.
- * Used to reconcile existing generic Apple Wallet rows ("Octopus Purchase", "Train", "Bus", etc.)
- * so current Octopus transactions match the Octopus App Source of Truth.
- */
 const VERIFIED_OCTOPUS_APP_RECORDS: Array<{
   ts: string;
   day: string;
@@ -221,43 +258,62 @@ const VERIFIED_OCTOPUS_APP_RECORDS: Array<{
   { ts: "2026-09-19 14:14", day: "2026-09-19", amountMinor: 820, merchant: "Green Minibuses" },
 ];
 
-/**
- * Repairs, reconciles, and deduplicates existing non-demo rows:
- * 1. Deletes any balance-statement or top-up rows (both pending and confirmed, including +600.0 Octopus Cards Limited).
- * 2. If a transaction's merchant name is actually a timestamp/date (e.g. "Thu 18:56", "2026-10-07"),
- *    moves that timestamp into occurredAt and renames merchant appropriately.
- * 3. Reconciles existing Apple Wallet Octopus rows against the Octopus App Source of Truth so merchant names,
- *    exact minute timestamps, and categories match the Octopus App.
- * 4. Deduplicates transactions with the exact same sourceId, amountMinor, and minute timestamp.
- */
-async function cleanupAndRepairExistingRows(): Promise<void> {
+export async function cleanupAndRepairExistingRows(): Promise<void> {
   try {
-    const [rows, allCategories, octopusSource] = await Promise.all([
+    const [rows, allCategories, rules, octopusSource, settings] = await Promise.all([
       db.transaction.findMany({
         where: { isDemo: false },
         include: { category: true, subcategory: true, source: true },
         orderBy: { createdAt: "asc" },
       }),
       db.category.findMany({ where: { archived: false } }),
+      db.merchantRule.findMany({
+        orderBy: { hits: "desc" },
+        include: { category: true, purpose: true },
+      }),
       db.paymentSource.findFirst({ where: { kind: "octopus" } }),
+      db.settings.findUnique({ where: { id: 1 } }),
     ]);
 
+    const reviewThresholdMinor = settings?.reviewThresholdMinor ?? 50000;
+
     const resolveCategoryIds = (merchantName: string) => {
-      const hint = classifyMerchant(merchantName);
-      if (!hint) return { categoryId: null, subcategoryId: null };
+      const matchedRule = rules.find((rule) => doesMerchantMatchRule(merchantName, rule.pattern));
+      if (matchedRule && matchedRule.category) {
+        const isChild = !!matchedRule.category.parentId;
+        const parentId = isChild ? matchedRule.category.parentId! : matchedRule.category.id;
+        const subId = isChild ? matchedRule.category.id : null;
+        return {
+          categoryId: parentId,
+          subcategoryId: subId,
+          fromSavedRule: true,
+          isKeywordFallback: false,
+        };
+      }
+
+      const hint = classifyMerchant(merchantName) as {
+        category: string;
+        subcategory?: string;
+        isKeywordFallback?: boolean;
+      } | null;
+      if (!hint) return { categoryId: null, subcategoryId: null, fromSavedRule: false, isKeywordFallback: false };
       const parent = allCategories.find((c) => c.name === hint.category && !c.parentId) ?? null;
       const child =
         parent && hint.subcategory
           ? allCategories.find((c) => c.parentId === parent.id && c.name === hint.subcategory) ?? null
           : null;
-      return { categoryId: parent?.id ?? null, subcategoryId: child?.id ?? null };
+      return {
+        categoryId: parent?.id ?? null,
+        subcategoryId: child?.id ?? null,
+        fromSavedRule: false,
+        isKeywordFallback: !!hint.isKeywordFallback,
+      };
     };
 
     const toDeleteIds: string[] = [];
     const survivingRows: typeof rows = [];
 
     for (const r of rows) {
-      // 1. Remove balance lines and top-ups
       if (
         r.type === "top_up" ||
         isBalanceLine(r.merchant) ||
@@ -269,40 +325,45 @@ async function cleanupAndRepairExistingRows(): Promise<void> {
       }
 
       let effectiveOccurredAt = r.occurredAt;
-      let effectiveMerchant = r.merchant;
+      let effectiveMerchant = cleanOcrMerchantName(r.merchant) || r.merchant;
       let effectivePrecision = r.datePrecision;
 
-      // 2. If merchant is a timestamp/date label (like "Thu 18:56", "Wed 22:34", "1h ago", "2026-10-07"), repair it!
-      if (isDateOrTimestampLabel(r.merchant)) {
-        const resolved = resolveRelativeDay(r.merchant, r.occurredAt);
+      if (isDateOrTimestampLabel(effectiveMerchant)) {
+        const resolved = resolveRelativeDay(effectiveMerchant, r.occurredAt);
         effectiveOccurredAt = resolved.date;
         effectivePrecision = resolved.precision;
-        effectiveMerchant = r.subcategory?.name || (r.category?.name === "Transport" ? "MTR Corporation Limited" : "Octopus");
+        effectiveMerchant =
+          r.subcategory?.name || (r.category?.name === "Transport" ? "MTR Corporation Limited" : "Octopus");
+      }
 
+      if (
+        effectiveMerchant !== r.merchant ||
+        effectiveOccurredAt.getTime() !== r.occurredAt.getTime() ||
+        effectivePrecision !== r.datePrecision
+      ) {
+        const norm = normalizeMerchant(effectiveMerchant);
         await db.transaction.update({
           where: { id: r.id },
           data: {
             occurredAt: effectiveOccurredAt,
             datePrecision: effectivePrecision,
             merchant: effectiveMerchant,
-            merchantNormalized: normalizeMerchant(effectiveMerchant),
+            merchantNormalized: norm,
           },
         });
         r.occurredAt = effectiveOccurredAt;
         r.datePrecision = effectivePrecision;
         r.merchant = effectiveMerchant;
-        r.merchantNormalized = normalizeMerchant(effectiveMerchant);
+        r.merchantNormalized = norm;
       }
 
       survivingRows.push(r);
     }
 
-    // 3. Reconcile Octopus rows against VERIFIED_OCTOPUS_APP_RECORDS (Octopus App Source of Truth)
     if (octopusSource) {
       const usedVerifiedIdx = new Set<number>();
       const matchedRowIds = new Set<string>();
 
-      // Pass 3A: Exact minute + amount match already in DB
       for (const r of survivingRows) {
         if (r.sourceId !== octopusSource.id) continue;
         const rMin = formatInZone(r.occurredAt, "yyyy-MM-dd HH:mm", "Asia/Hong_Kong");
@@ -328,11 +389,12 @@ async function cleanupAndRepairExistingRows(): Promise<void> {
             r.merchant = v.merchant;
             r.merchantNormalized = normalizeMerchant(v.merchant);
             r.datePrecision = "minute";
+            r.categoryId = categoryId ?? r.categoryId;
+            r.subcategoryId = subcategoryId ?? r.subcategoryId;
           }
         }
       }
 
-      // Pass 3B: Same calendar day (or date mentioned in rawText) + same amount
       for (const r of survivingRows) {
         if (r.sourceId !== octopusSource.id || matchedRowIds.has(r.id)) continue;
         const rDay = formatInZone(r.occurredAt, "yyyy-MM-dd", "Asia/Hong_Kong");
@@ -367,11 +429,11 @@ async function cleanupAndRepairExistingRows(): Promise<void> {
           r.datePrecision = "minute";
           r.merchant = v.merchant;
           r.merchantNormalized = normalizeMerchant(v.merchant);
+          r.categoryId = categoryId ?? r.categoryId;
+          r.subcategoryId = subcategoryId ?? r.subcategoryId;
         }
       }
 
-      // Pass 3C: Generic Apple Wallet Octopus rows ("Octopus Purchase", "Purchase", "Train", "Bus", "Octopus")
-      // that were uploaded earlier without their September date — match by exact amountMinor
       for (const r of survivingRows) {
         if (r.sourceId !== octopusSource.id || matchedRowIds.has(r.id)) continue;
         if (!isGenericWalletMerchant(r.merchant) && r.datePrecision === "minute") continue;
@@ -404,27 +466,69 @@ async function cleanupAndRepairExistingRows(): Promise<void> {
           r.datePrecision = "minute";
           r.merchant = v.merchant;
           r.merchantNormalized = normalizeMerchant(v.merchant);
+          r.categoryId = categoryId ?? r.categoryId;
+          r.subcategoryId = subcategoryId ?? r.subcategoryId;
         }
       }
     }
 
-    // 4. Re-classify any Octopus row that has a known merchant (e.g. "Green Minibuses") but is missing category/subcategory
     for (const r of survivingRows) {
-      if (!r.categoryId || !r.subcategoryId) {
-        const { categoryId, subcategoryId } = resolveCategoryIds(r.merchant);
-        if (categoryId && (categoryId !== r.categoryId || subcategoryId !== r.subcategoryId)) {
-          await db.transaction.update({
-            where: { id: r.id },
-            data: {
-              categoryId,
-              subcategoryId: subcategoryId ?? r.subcategoryId,
-            },
+      const resolved = resolveCategoryIds(r.merchant);
+      const nextCategoryId = resolved.fromSavedRule
+        ? (resolved.categoryId ?? r.categoryId)
+        : (r.categoryId ?? resolved.categoryId);
+      const nextSubcategoryId = resolved.fromSavedRule
+        ? (resolved.subcategoryId ?? r.subcategoryId)
+        : (r.subcategoryId ?? resolved.subcategoryId);
+
+      const catObj = nextCategoryId ? allCategories.find((c) => c.id === nextCategoryId) : null;
+      const isP2P = !!r.counterparty || (r.source?.kind === "payme" && !catObj);
+
+      let nextPurposeStatus = r.purposeStatus;
+      let nextReviewReasons = r.reviewReasons;
+
+      if (r.purposeStatus === "needs_review") {
+        if (resolved.fromSavedRule && nextCategoryId && r.amountMinor <= reviewThresholdMinor && !isP2P) {
+          nextPurposeStatus = "confirmed";
+          nextReviewReasons = "[]";
+        } else if (nextCategoryId && !resolved.isKeywordFallback) {
+          const decision = decideReview({
+            amountMinor: r.amountMinor,
+            type: r.type as "expense" | "income" | "transfer" | "refund" | "top_up",
+            categoryAmbiguous: catObj ? catObj.ambiguous : null,
+            hasRulePurpose: resolved.fromSavedRule,
+            isPersonToPerson: isP2P,
+            reviewThresholdMinor,
           });
+          nextPurposeStatus = decision.status === "auto" ? "confirmed" : "needs_review";
+          nextReviewReasons = JSON.stringify(decision.reasons);
+        } else if (nextCategoryId && resolved.isKeywordFallback) {
+          nextReviewReasons = JSON.stringify(["Suggested from keyword — please confirm or change"]);
         }
+      }
+
+      if (
+        nextCategoryId !== r.categoryId ||
+        nextSubcategoryId !== r.subcategoryId ||
+        nextPurposeStatus !== r.purposeStatus ||
+        nextReviewReasons !== r.reviewReasons
+      ) {
+        await db.transaction.update({
+          where: { id: r.id },
+          data: {
+            categoryId: nextCategoryId,
+            subcategoryId: nextSubcategoryId,
+            purposeStatus: nextPurposeStatus,
+            reviewReasons: nextReviewReasons,
+          },
+        });
+        r.categoryId = nextCategoryId;
+        r.subcategoryId = nextSubcategoryId;
+        r.purposeStatus = nextPurposeStatus;
+        r.reviewReasons = nextReviewReasons;
       }
     }
 
-    // 5. Deduplicate by same sourceId + same minute + same amount
     const seenKey = new Set<string>();
     for (const r of survivingRows) {
       const minuteBucket = Math.floor(r.occurredAt.getTime() / 60_000);
@@ -444,7 +548,7 @@ async function cleanupAndRepairExistingRows(): Promise<void> {
   }
 }
 
-async function runInit(): Promise<void> {
+async function ensureSchemaAndTaxonomy(): Promise<void> {
   let existing = null;
   try {
     existing = await db.settings.findUnique({ where: { id: 1 } });
@@ -456,8 +560,6 @@ async function runInit(): Promise<void> {
   }
 
   if (existing) {
-    await cleanupAndRepairExistingRows();
-
     const [legacyFound, newFoodFound] = await Promise.all([
       db.category.findFirst({
         where: {
@@ -474,6 +576,8 @@ async function runInit(): Promise<void> {
 
     if (legacyFound || !newFoodFound) {
       await migrateTaxonomy(db);
+    } else {
+      await ensureReferenceData(db);
     }
     return;
   }
@@ -488,16 +592,18 @@ async function runInit(): Promise<void> {
   }
 }
 
-/**
- * Automatically creates tables, reference data, repairs misdetected rows, reconciles Octopus App names,
- * and applies taxonomy migrations on first run.
- */
 export async function ensureDatabaseInitialized(): Promise<void> {
-  if (!globalForInit.__tallyDbReady) {
-    globalForInit.__tallyDbReady = runInit().catch((err) => {
-      globalForInit.__tallyDbReady = undefined;
+  if (!globalForInit.__tallySchemaReady) {
+    globalForInit.__tallySchemaReady = ensureSchemaAndTaxonomy().catch((err) => {
+      globalForInit.__tallySchemaReady = undefined;
       throw err;
     });
   }
-  return globalForInit.__tallyDbReady;
+  await globalForInit.__tallySchemaReady;
+
+  const now = Date.now();
+  if (!globalForInit.__tallyLastRepairAt || now - globalForInit.__tallyLastRepairAt > 3000) {
+    globalForInit.__tallyLastRepairAt = now;
+    await cleanupAndRepairExistingRows();
+  }
 }

@@ -8,9 +8,48 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tag } from "@/components/app/tag";
 import { Money } from "@/components/app/money";
+import { normalizeMerchant } from "@/lib/text";
 import { formatInZone } from "@/lib/time";
 import { REVIEW_REASONS, parseJsonArray, type ReviewReason } from "@/lib/domain";
 import { confirmPurpose, confirmAllAsPersonal, deletePendingTransaction } from "./actions";
+
+function cleanOcrMerchantName(input: string): string {
+  if (!input) return "";
+  return input
+    .normalize("NFKC")
+    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalizeMerchantKey(input: string): string {
+  return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
+    .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
+    .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
+    .replace(/\bwel+come\b/g, "wellcome")
+    .replace(/\bminibuses\b/g, "minibus")
+    .replace(/\bbuses\b/g, "bus")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
+  const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
+  const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
+  if (!normMerchant || !normRule) return false;
+  if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
+    return true;
+  }
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule) return false;
+  return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
+}
 
 export type PendingTx = {
   id: string;
@@ -37,7 +76,7 @@ export type PurposeOption = {
   shortcutKey: string | null;
 };
 
-type CategoryOption = { id: string; name: string; children: { id: string; name: string }[] };
+type CategoryOption = { id: string; name: string; color?: string; children: { id: string; name: string }[] };
 
 type DraftEdits = {
   merchant: string;
@@ -91,6 +130,59 @@ export function ReviewInbox({
     }));
   };
 
+  const syncAndApplyRuleAcrossMatching = (
+    sourceTx: PendingTx,
+    categoryId: string,
+    subcategoryId: string | null,
+  ) => {
+    const sourceMerchant = edits[sourceTx.id]?.merchant?.trim() || sourceTx.merchant;
+    const matchedCat = categories.find((c) => c.id === categoryId);
+
+    setClassifications((prev) => {
+      const next = { ...prev };
+      for (const item of items) {
+        const itemMerchant = edits[item.id]?.merchant?.trim() || item.merchant;
+        if (item.id === sourceTx.id || doesMerchantMatchRule(itemMerchant, sourceMerchant)) {
+          next[item.id] = { categoryId, subcategoryId };
+        }
+      }
+      return next;
+    });
+
+    if (matchedCat) {
+      setItems((prev) =>
+        prev.map((item) => {
+          const itemMerchant = edits[item.id]?.merchant?.trim() || item.merchant;
+          if (item.id === sourceTx.id || doesMerchantMatchRule(itemMerchant, sourceMerchant)) {
+            return {
+              ...item,
+              categoryId,
+              subcategoryId,
+              category: { name: matchedCat.name, color: matchedCat.color ?? "blue" },
+            };
+          }
+          return item;
+        }),
+      );
+    }
+
+    startTransition(async () => {
+      const res = await confirmPurpose({
+        transactionId: sourceTx.id,
+        merchant: sourceMerchant,
+        categoryId,
+        subcategoryId,
+        saveRule: true,
+        ruleOnly: true,
+      });
+      if (res.ok) {
+        toast.success(res.ok);
+      } else if (res.error) {
+        toast.error(res.error);
+      }
+    });
+  };
+
   const handleConfirm = (tx: PendingTx) => {
     const txId = tx.id;
     const saveRule = !!rememberRules[txId];
@@ -98,7 +190,10 @@ export function ReviewInbox({
     const displayMerchant = draft?.merchant?.trim() || tx.merchant;
 
     startTransition(async () => {
-      const selection = classifications[txId];
+      const selection = classifications[txId] ?? {
+        categoryId: tx.categoryId ?? undefined,
+        subcategoryId: tx.subcategoryId,
+      };
       const res = await confirmPurpose({
         transactionId: txId,
         saveRule,
@@ -113,13 +208,29 @@ export function ReviewInbox({
           : {}),
       });
       if (res.ok) {
+        const removedIds = new Set([txId, ...(res.autoConfirmedIds ?? [])]);
         setClassifications((prev) => {
           const next = { ...prev };
-          delete next[txId];
+          for (const id of removedIds) {
+            delete next[id];
+          }
           return next;
         });
-        setItems((prev) => prev.filter((i) => i.id !== txId));
-        toast.success(`Confirmed ${displayMerchant}${saveRule ? " (rule saved)" : ""}`);
+        setItems((prev) => prev.filter((i) => !removedIds.has(i.id)));
+
+        const extraConfirmed = res.autoConfirmedIds?.length ?? 0;
+        const extraUpdated = res.autoUpdatedCount ?? 0;
+        if (extraConfirmed > 0) {
+          toast.success(
+            `Confirmed ${displayMerchant} & auto-confirmed ${extraConfirmed} matching transaction${extraConfirmed === 1 ? "" : "s"}`,
+          );
+        } else if (saveRule && extraUpdated > 0) {
+          toast.success(
+            `Confirmed ${displayMerchant} & categorized ${extraUpdated} matching transaction${extraUpdated === 1 ? "" : "s"}`,
+          );
+        } else {
+          toast.success(`Confirmed ${displayMerchant}${saveRule ? " (rule saved)" : ""}`);
+        }
       } else {
         toast.error(res.error || "Failed");
       }
@@ -151,8 +262,19 @@ export function ReviewInbox({
     });
   };
 
-  const toggleRemember = (txId: string) => {
-    setRememberRules((prev) => ({ ...prev, [txId]: !prev[txId] }));
+  const toggleRemember = (tx: PendingTx) => {
+    const nextChecked = !rememberRules[tx.id];
+    setRememberRules((prev) => ({ ...prev, [tx.id]: nextChecked }));
+
+    if (nextChecked) {
+      const currentSelection = classifications[tx.id] ?? {
+        categoryId: tx.categoryId ?? "",
+        subcategoryId: tx.subcategoryId,
+      };
+      if (currentSelection.categoryId) {
+        syncAndApplyRuleAcrossMatching(tx, currentSelection.categoryId, currentSelection.subcategoryId);
+      }
+    }
   };
 
   if (items.length === 0) {
@@ -184,7 +306,7 @@ export function ReviewInbox({
           variant="outline"
           size="sm"
           onClick={handleConfirmAll}
-          disabled={pending || Object.keys(classifications).length > 0}
+          disabled={pending}
           className="gap-1.5 min-h-11"
         >
           <CheckCheck className="size-3.5" />
@@ -214,7 +336,15 @@ export function ReviewInbox({
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-[15px] font-semibold text-foreground">{displayMerchant}</span>
-                    {tx.category ? <Tag color={tx.category.color}>{tx.category.name}</Tag> : <Tag>Uncategorised</Tag>}
+                    {selectedCategory ? (
+                      <Tag color={selectedCategory.color ?? tx.category?.color ?? "blue"}>
+                        {selectedCategory.name}
+                      </Tag>
+                    ) : tx.category ? (
+                      <Tag color={tx.category.color}>{tx.category.name}</Tag>
+                    ) : (
+                      <Tag>Uncategorised</Tag>
+                    )}
                     <span className="text-[12px] text-muted-foreground">· {tx.source.name}</span>
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[12px] text-muted-foreground">
@@ -317,12 +447,16 @@ export function ReviewInbox({
                   id={`category-${tx.id}`}
                   value={selection.categoryId}
                   disabled={pending}
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const nextCatId = event.target.value;
                     setClassifications((prev) => ({
                       ...prev,
-                      [tx.id]: { categoryId: event.target.value, subcategoryId: null },
-                    }))
-                  }
+                      [tx.id]: { categoryId: nextCatId, subcategoryId: null },
+                    }));
+                    if (remember && nextCatId) {
+                      syncAndApplyRuleAcrossMatching(tx, nextCatId, null);
+                    }
+                  }}
                   className="min-h-11 w-full max-w-sm rounded-md border border-input bg-background px-3 text-sm"
                 >
                   <option value="">Uncategorised</option>
@@ -342,12 +476,16 @@ export function ReviewInbox({
                           type="button"
                           disabled={pending}
                           aria-pressed={(selection.subcategoryId ?? "") === child.id}
-                          onClick={() =>
+                          onClick={() => {
+                            const nextSubId = child.id || null;
                             setClassifications((prev) => ({
                               ...prev,
-                              [tx.id]: { ...selection, subcategoryId: child.id || null },
-                            }))
-                          }
+                              [tx.id]: { ...selection, subcategoryId: nextSubId },
+                            }));
+                            if (remember && selection.categoryId) {
+                              syncAndApplyRuleAcrossMatching(tx, selection.categoryId, nextSubId);
+                            }
+                          }}
                           className="min-h-11 rounded-md border border-border px-3 text-[12.5px] transition-colors aria-pressed:border-primary aria-pressed:bg-accent aria-pressed:font-semibold focus-visible:outline-2 focus-visible:outline-primary"
                         >
                           {child.name}
@@ -363,7 +501,7 @@ export function ReviewInbox({
                   <input
                     type="checkbox"
                     checked={remember}
-                    onChange={() => toggleRemember(tx.id)}
+                    onChange={() => toggleRemember(tx)}
                     className="rounded border-border text-primary focus:ring-0"
                   />
                   <Sparkles className="size-3 text-warning" />
