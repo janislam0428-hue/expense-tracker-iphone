@@ -11,7 +11,11 @@ import {
   type ParsedNotification,
 } from "./notification";
 import type { Channel } from "@/lib/domain";
-import { classifyMerchant } from "@/lib/reference/classify";
+import {
+  classifyMerchant,
+  cleanMerchantForSearch,
+  searchAndClassifyMerchant,
+} from "@/lib/reference/classify";
 
 export type IngestResult = {
   ok: boolean;
@@ -48,6 +52,8 @@ const GENERIC_WALLET_MERCHANTS = [
  * - Treats Octopus App screenshots (`isAuthoritativeSource: true`) as the Source of Truth for Octopus,
  *   automatically matching and upgrading any generic Apple Wallet entries on the same day + amount
  *   with the Octopus App's exact merchant name, minute timestamp, and category.
+ * - Automatically searches the web (`searchAndClassifyMerchant`) when a brand-new merchant appears
+ *   and saves the discovered category into `MerchantRule` so future transactions match instantly.
  * - Preserves distinct same-day trips that have different minute timestamps (e.g. two $13.20 MTR trips at 15:50 and 18:29).
  * - Ignores top-ups and remaining balances so totals are never doubled.
  */
@@ -103,7 +109,7 @@ export async function ingestNotificationRecord(
     });
   }
 
-  // 2. Resolve MerchantRule & Category classification first so we can also apply it when upgrading Wallet rows
+  // 2. Resolve MerchantRule, Local Rules, or Automatic Web Search Discovery
   const rules = await db.merchantRule.findMany({
     orderBy: { hits: "desc" },
     include: { category: true, purpose: true },
@@ -117,7 +123,17 @@ export async function ingestNotificationRecord(
   let subcategoryId: string | null = matchedRule?.category?.parentId ? matchedRule.categoryId : null;
   const purposeId: string | null = matchedRule?.purposeId ?? null;
 
-  const hint = classifyMerchant(parsed.merchantNormalized);
+  let hint = classifyMerchant(parsed.merchant);
+  let learnedFromWebSearch = false;
+
+  // If no saved rule and no local keyword match, automatically search the web to identify the merchant!
+  if (!categoryId && !hint && !parsed.isPersonToPerson && !isGenericWalletMerchant(parsed.merchant)) {
+    hint = await searchAndClassifyMerchant(parsed.merchant);
+    if (hint) {
+      learnedFromWebSearch = true;
+    }
+  }
+
   if (!categoryId) {
     const categories = await db.category.findMany({ where: { archived: false } });
     if (parsed.isPersonToPerson) {
@@ -140,11 +156,35 @@ export async function ingestNotificationRecord(
     subcategoryId = child?.id ?? null;
   }
 
+  // If the merchant was newly discovered via web search, save a permanent MerchantRule in Turso
+  // so future transactions at this merchant are categorized in 0ms without needing to search again!
+  if (learnedFromWebSearch && (subcategoryId || categoryId)) {
+    const cleanPattern = cleanMerchantForSearch(parsed.merchant).toLowerCase().trim();
+    if (cleanPattern.length >= 3) {
+      const existingRule = rules.find((r) => r.pattern.toLowerCase().trim() === cleanPattern);
+      if (!existingRule) {
+        await db.merchantRule
+          .create({
+            data: {
+              pattern: cleanPattern,
+              matchType: "contains",
+              categoryId: subcategoryId ?? categoryId,
+              sourceKind: parsed.sourceKind,
+              hits: 1,
+              lastUsedAt: new Date(),
+              isDemo: false,
+            },
+          })
+          .catch(() => null);
+      }
+    }
+  }
+
   const review = decideReview({
     amountMinor: parsed.amountMinor,
     type: parsed.type,
     categoryAmbiguous: category ? category.ambiguous : null,
-    hasRulePurpose: !!(matchedRule?.categoryId || matchedRule?.purposeId),
+    hasRulePurpose: !!(matchedRule?.categoryId || matchedRule?.purposeId || learnedFromWebSearch),
     isPersonToPerson: parsed.isPersonToPerson,
     reviewThresholdMinor: settings.reviewThresholdMinor,
   });
@@ -170,8 +210,6 @@ export async function ingestNotificationRecord(
   });
 
   if (exactMinuteMatch) {
-    // If incoming is from the Octopus App (Source of Truth) and the existing row has a generic Wallet name,
-    // upgrade the existing row's merchant name and category in-place!
     if (
       parsed.isAuthoritativeSource &&
       !isGenericWalletMerchant(parsed.merchant) &&
@@ -218,8 +256,7 @@ export async function ingestNotificationRecord(
   }
 
   // 3B. If incoming is from the Octopus App (Source of Truth), check if there is an existing Apple Wallet
-  //     entry on the same calendar day with the same amount (e.g. generic "Octopus Purchase", "Train", "Bus",
-  //     or date-only precision) and upgrade it in-place so the Octopus App is the single Source of Truth!
+  //     entry on the same calendar day with the same amount and upgrade it in-place!
   if (parsed.isAuthoritativeSource && parsed.sourceKind === "octopus") {
     const existingWalletRow = await db.transaction.findFirst({
       where: {
@@ -270,8 +307,7 @@ export async function ingestNotificationRecord(
   }
 
   // 3C. For non-authoritative or date-only records (Apple Wallet, PayMe App history, Hang Seng Card history),
-  //     check for same-day duplicates so Apple Wallet never duplicates an existing Octopus App transaction
-  //     and overlapping scrolled screenshots never duplicate.
+  //     check for same-day duplicates.
   if (!parsed.isAuthoritativeSource || parsed.datePrecision !== "minute") {
     const sameDayExisting = await db.transaction.findFirst({
       where: {
@@ -281,14 +317,10 @@ export async function ingestNotificationRecord(
         occurredAt: { gte: startOfDay, lt: endOfDay },
         ...(input.batchId ? { NOT: { importBatchId: input.batchId } } : {}),
         OR: [
-          // Same remaining balance on the same day
           ...(parsed.balanceAfterMinor !== undefined
             ? [{ balanceAfterMinor: parsed.balanceAfterMinor }]
             : []),
-          // Same normalized merchant on the same day
           { merchantNormalized: parsed.merchantNormalized },
-          // If incoming is a generic Apple Wallet Octopus entry (or date-only), any existing Octopus record
-          // of the same amount on the same day from the Octopus App takes precedence
           ...(parsed.sourceKind === "octopus" &&
           (isGenericWalletMerchant(parsed.merchant) || parsed.datePrecision !== "minute")
             ? [{ sourceId: source.id }]
