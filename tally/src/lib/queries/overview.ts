@@ -88,6 +88,7 @@ export type CategoryPacingFlag = {
   limitMinor: number;
   hasCustomLimit: boolean;
   pctOfLimit: number;
+  varianceMinor: number;
   latestTxDateLabel: string | null;
   latestTxDay: number;
   proRataAtTxMinor: number;
@@ -96,7 +97,54 @@ export type CategoryPacingFlag = {
   lastMonthMinor: number;
   avgMonthlyMinor: number;
   suggestedThresholdMinor: number;
+  thresholdComment: string;
+  thresholdUpdatedAt: string | null;
   dailyCumulative: DailyPacePoint[];
+};
+
+export type SpendingSurgeCategory = {
+  categoryId: string;
+  name: string;
+  color: string;
+  spentMinor: number;
+  historicalAvgMinor: number;
+  deltaMinor: number;
+  surgePct: number;
+  summaryText: string;
+};
+
+export type ThresholdLogEntry = {
+  id: string;
+  monthKey: string;
+  categoryId: string | null;
+  categoryName: string;
+  previousMinor: number | null;
+  amountMinor: number;
+  comment: string;
+  source: "suggestion" | "manual";
+  changedAt: string;
+  changedAtFormatted: string;
+};
+
+export type MonthlySnapshot = {
+  monthKey: string; // e.g. "2026-10", "2026-09"
+  label: string; // e.g. "October 2026", "September 2026"
+  shortLabel: string; // e.g. "Oct 2026", "Sep 2026"
+  isCurrentMonth: boolean;
+  daysElapsed: number;
+  daysInMonth: number;
+  totalMinor: number;
+  prevComparisonMinor: number;
+  transactionCount: number;
+  avgPerDayMinor: number;
+  overallLimitMinor: number;
+  topCategory: CategorySlice | null;
+  topSubcategory: SubcategorySlice | null;
+  surgeCategory: SpendingSurgeCategory | null;
+  byCategory: CategorySlice[];
+  bySubcategory: SubcategorySlice[];
+  categoryPacing: CategoryPacingFlag[];
+  overallDailyCumulative: DailyPacePoint[];
 };
 
 function roundSuggestedMinor(rawMinor: number): number {
@@ -121,66 +169,200 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
   const thisYearStart = yearStart(now, zone);
 
   // Earliest date needed for 6 months + Full Year analytics
-  const sixMonthsAgoParts = zonedParts(now, zone);
-  let earliestYear = sixMonthsAgoParts.year;
-  let earliestMonth = sixMonthsAgoParts.month - 5;
-  if (earliestMonth <= 0) {
+  const nowParts = zonedParts(now, zone);
+  let earliestYear = nowParts.year;
+  let earliestMonth = nowParts.month - 6;
+  while (earliestMonth <= 0) {
     earliestMonth += 12;
     earliestYear -= 1;
   }
   const sixMonthsStart = zonedDate(earliestYear, earliestMonth, 1, 0, 0, zone);
   const queryStart = new Date(Math.min(thisYearStart.getTime(), sixMonthsStart.getTime()));
 
-  const [allConfirmedTxs, categories, subcategories, pendingAgg, recent, first, lastBatch, alertRule] =
-    await Promise.all([
-      db.transaction.findMany({
-        where: {
-          ...scope,
-          ...CONFIRMED_SPEND_WHERE,
-          occurredAt: { gte: queryStart },
-          OR: [{ isDemo: false }, { occurredAt: { lt: now } }],
-        },
-        select: {
-          id: true,
-          occurredAt: true,
-          amountMinor: true,
-          type: true,
-          merchant: true,
-          categoryId: true,
-          subcategoryId: true,
-        },
-        orderBy: { occurredAt: "asc" },
-      }),
-      db.category.findMany({
-        where: { parentId: null, archived: false },
-        orderBy: { sortOrder: "asc" },
-      }),
-      db.category.findMany({
-        where: { NOT: { parentId: null }, archived: false },
-        orderBy: { sortOrder: "asc" },
-      }),
-      db.transaction.aggregate({
-        where: { ...scope, purposeStatus: "needs_review", duplicateOfId: null },
-        _count: { _all: true },
-        _sum: { amountMinor: true },
-      }),
-      db.transaction.findMany({
-        where: {
-          ...scope,
-          ...CONFIRMED_SPEND_WHERE,
-          OR: [{ isDemo: false }, { occurredAt: { lt: now } }],
-        },
-        orderBy: { occurredAt: "desc" },
-        take: 8,
-        include: { category: true, subcategory: true, source: true, purpose: true },
-      }),
-      db.transaction.findFirst({ where: scope, orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
-      db.importBatch.findFirst({ where: scope, orderBy: { createdAt: "desc" }, select: { createdAt: true } }),
-      db.alertRule.findFirst({ where: { scope: "global", enabled: true } }),
-    ]);
+  const [
+    allConfirmedTxs,
+    categories,
+    subcategories,
+    pendingAgg,
+    recent,
+    first,
+    lastBatch,
+    alertRule,
+    allBudgets,
+    rawThresholdLogs,
+  ] = await Promise.all([
+    db.transaction.findMany({
+      where: {
+        ...scope,
+        ...CONFIRMED_SPEND_WHERE,
+        occurredAt: { gte: queryStart },
+        OR: [{ isDemo: false }, { occurredAt: { lt: now } }],
+      },
+      select: {
+        id: true,
+        occurredAt: true,
+        amountMinor: true,
+        type: true,
+        merchant: true,
+        categoryId: true,
+        subcategoryId: true,
+      },
+      orderBy: { occurredAt: "asc" },
+    }),
+    db.category.findMany({
+      where: { parentId: null, archived: false },
+      orderBy: { sortOrder: "asc" },
+    }),
+    db.category.findMany({
+      where: { NOT: { parentId: null }, archived: false },
+      orderBy: { sortOrder: "asc" },
+    }),
+    db.transaction.aggregate({
+      where: { ...scope, purposeStatus: "needs_review", duplicateOfId: null },
+      _count: { _all: true },
+      _sum: { amountMinor: true },
+    }),
+    db.transaction.findMany({
+      where: {
+        ...scope,
+        ...CONFIRMED_SPEND_WHERE,
+        OR: [{ isDemo: false }, { occurredAt: { lt: now } }],
+      },
+      orderBy: { occurredAt: "desc" },
+      take: 8,
+      include: { category: true, subcategory: true, source: true, purpose: true },
+    }),
+    db.transaction.findFirst({ where: scope, orderBy: { occurredAt: "asc" }, select: { occurredAt: true } }),
+    db.importBatch.findFirst({ where: scope, orderBy: { createdAt: "desc" }, select: { createdAt: true } }).catch(() => null),
+    db.alertRule.findFirst({ where: { scope: "global", enabled: true } }),
+    db.budget.findMany(),
+    db.alertRule.findMany({ where: { scope: "threshold_log" } }),
+  ]);
 
   const catById = new Map(categories.map((c) => [c.id, c]));
   const subById = new Map(subcategories.map((s) => [s.id, s]));
+  const NON_SPEND_CATS = new Set(["Money Received", "Top ups & Transfers"]);
+  const spendCategories = categories.filter((c) => !NON_SPEND_CATS.has(c.name));
+
+  // Parse threshold change logs sorted newest-first
+  const thresholdLogs: ThresholdLogEntry[] = [];
+  for (const row of rawThresholdLogs) {
+    try {
+      const parsed = JSON.parse(row.params || "{}");
+      const changedAtIso = typeof parsed.changedAt === "string" ? parsed.changedAt : new Date().toISOString();
+      const changedDate = new Date(changedAtIso);
+      const catObj = row.categoryId ? catById.get(row.categoryId) : undefined;
+      thresholdLogs.push({
+        id: row.id,
+        monthKey: typeof parsed.monthKey === "string" ? parsed.monthKey : row.strategy,
+        categoryId: row.categoryId ?? null,
+        categoryName: parsed.categoryName || catObj?.name || "Default Monthly Alert",
+        previousMinor: typeof parsed.previousMinor === "number" ? parsed.previousMinor : null,
+        amountMinor: typeof parsed.amountMinor === "number" ? parsed.amountMinor : settings.alertThresholdMinor,
+        comment:
+          typeof parsed.comment === "string" && parsed.comment.trim()
+            ? parsed.comment.trim()
+            : "threshold testing and adjustment",
+        source: parsed.source === "suggestion" ? "suggestion" : "manual",
+        changedAt: changedAtIso,
+        changedAtFormatted: Number.isNaN(changedDate.getTime())
+          ? changedAtIso
+          : formatInZone(changedDate, "d MMM yyyy, HH:mm", zone),
+      });
+    } catch {
+      // Ignore malformed log entry
+    }
+  }
+  thresholdLogs.sort((a, b) => b.changedAt.localeCompare(a.changedAt));
+
+  // Ensure current month ("YYYY-MM") has a Budget snapshot for each spending category so that if
+  // the month ends without further adjustments, this month's threshold is locked in for historical viewing.
+  const currentMonthKey = formatInZone(month.start, "yyyy-MM", zone);
+  const budgetMap = new Map<string, number>();
+  for (const b of allBudgets) {
+    budgetMap.set(`${b.categoryId}::${b.period}`, b.amountMinor);
+  }
+
+  for (const c of spendCategories) {
+    const key = `${c.id}::${currentMonthKey}`;
+    const currentEffective = c.monthlyAlertMinor ?? settings.alertThresholdMinor;
+    if (!budgetMap.has(key)) {
+      budgetMap.set(key, currentEffective);
+      await db.budget
+        .upsert({
+          where: { categoryId_period: { categoryId: c.id, period: currentMonthKey } },
+          create: { categoryId: c.id, period: currentMonthKey, amountMinor: currentEffective },
+          update: {},
+        })
+        .catch(() => null);
+    }
+  }
+
+  // Helper to resolve effective threshold & latest comment for (categoryId, monthKey) across the 6-month window.
+  // Rule:
+  // 1. If a threshold was set/changed in `monthKey` (stored in thresholdLogs or Budget for `monthKey`),
+  //    use the LAST change made in `monthKey`.
+  // 2. If no change was made in `monthKey`, carry forward the final threshold from the most recent prior month
+  //    (or fall back to the category's current monthlyAlertMinor / global alertThresholdMinor).
+  const monthKeysChronological: string[] = [];
+  for (let i = 5; i >= 0; i--) {
+    let y = nowParts.year;
+    let m = nowParts.month - i;
+    while (m <= 0) {
+      m += 12;
+      y -= 1;
+    }
+    const mStart = zonedDate(y, m, 1, 0, 0, zone);
+    monthKeysChronological.push(formatInZone(mStart, "yyyy-MM", zone));
+  }
+
+  const resolvedThresholds = new Map<
+    string,
+    { limitMinor: number; comment: string; updatedAt: string | null; isCarriedForward: boolean }
+  >();
+
+  for (const c of spendCategories) {
+    const fallbackMinor = c.monthlyAlertMinor ?? settings.alertThresholdMinor;
+    let runningMinor = fallbackMinor;
+    let runningComment = "threshold testing and adjustment";
+    let runningUpdatedAt: string | null = null;
+
+    for (const mKey of monthKeysChronological) {
+      // Find the latest log entry for this category in this specific month
+      const logsForMonth = thresholdLogs.filter(
+        (l) => l.monthKey === mKey && (l.categoryId === c.id || l.categoryId === null),
+      );
+      const latestLog = logsForMonth[0] ?? null; // thresholdLogs is sorted newest-first
+      const explicitBudget = budgetMap.get(`${c.id}::${mKey}`);
+
+      if (latestLog) {
+        runningMinor = latestLog.categoryId === c.id ? latestLog.amountMinor : explicitBudget ?? latestLog.amountMinor;
+        runningComment = latestLog.comment;
+        runningUpdatedAt = latestLog.changedAtFormatted;
+        resolvedThresholds.set(`${c.id}::${mKey}`, {
+          limitMinor: runningMinor,
+          comment: runningComment,
+          updatedAt: runningUpdatedAt,
+          isCarriedForward: false,
+        });
+      } else if (explicitBudget !== undefined) {
+        runningMinor = explicitBudget;
+        resolvedThresholds.set(`${c.id}::${mKey}`, {
+          limitMinor: runningMinor,
+          comment: runningComment,
+          updatedAt: runningUpdatedAt,
+          isCarriedForward: true,
+        });
+      } else {
+        resolvedThresholds.set(`${c.id}::${mKey}`, {
+          limitMinor: runningMinor,
+          comment: runningComment,
+          updatedAt: runningUpdatedAt,
+          isCarriedForward: true,
+        });
+      }
+    }
+  }
 
   // Helper to compute slices for any time window [start, end)
   function buildHorizon(
@@ -189,6 +371,7 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
     sublabel: string,
     start: Date,
     end: Date,
+    mKeyForLimits = currentMonthKey,
   ): HorizonSummary {
     const catMap = new Map<string | null, { net: number; count: number }>();
     const subMap = new Map<string | null, { net: number; count: number; parentId: string | null }>();
@@ -216,7 +399,10 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
       .filter(([, v]) => v.net > 0)
       .map(([id, v]) => {
         const c = id ? catById.get(id) : undefined;
-        const limitMinor = c?.monthlyAlertMinor ?? settings.alertThresholdMinor;
+        const limitMinor =
+          (id ? resolvedThresholds.get(`${id}::${mKeyForLimits}`)?.limitMinor : undefined) ??
+          c?.monthlyAlertMinor ??
+          settings.alertThresholdMinor;
         return {
           id,
           name: c?.name ?? "Uncategorised",
@@ -332,7 +518,6 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
 
   // Build Month-over-Month series (last 6 months)
   const monthlySeries: TimeSeriesBar[] = [];
-  const nowParts = zonedParts(now, zone);
   for (let i = 5; i >= 0; i--) {
     let y = nowParts.year;
     let m = nowParts.month - i;
@@ -376,125 +561,251 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
     });
   }
 
-  // Overall daily cumulative series for the current month
-  const overallDailySpend = new Array<number>(totalDaysInMonth + 1).fill(0);
-  const catDailySpend = new Map<string, number[]>();
-  const catLatestTxDate = new Map<string, Date>();
-
-  for (const c of categories) {
-    catDailySpend.set(c.id, new Array<number>(totalDaysInMonth + 1).fill(0));
-  }
-
-  for (const tx of allConfirmedTxs) {
-    if (tx.occurredAt < month.start || tx.occurredAt >= month.end) continue;
-    const tp = zonedParts(tx.occurredAt, zone);
-    const dayNum = Math.min(totalDaysInMonth, Math.max(1, tp.day));
-    const signed = tx.type === "refund" ? -tx.amountMinor : tx.amountMinor;
-    overallDailySpend[dayNum] += signed;
-
-    if (tx.categoryId && catDailySpend.has(tx.categoryId)) {
-      const arr = catDailySpend.get(tx.categoryId)!;
-      arr[dayNum] += signed;
-      const prevLatest = catLatestTxDate.get(tx.categoryId);
-      if (!prevLatest || tx.occurredAt > prevLatest) {
-        catLatestTxDate.set(tx.categoryId, tx.occurredAt);
+  // Precompute historical average monthly spend per category across active months
+  const catHistoricalAvg = new Map<string, number>();
+  for (const c of spendCategories) {
+    const activeTotals: number[] = [];
+    for (const mBar of monthlySeries) {
+      const found = mBar.byCategory.find((x) => x.categoryId === c.id);
+      if (found && found.amountMinor > 0) {
+        activeTotals.push(found.amountMinor);
       }
     }
+    const avg =
+      activeTotals.length > 0 ? Math.round(activeTotals.reduce((a, b) => a + b, 0) / activeTotals.length) : 0;
+    catHistoricalAvg.set(c.id, avg);
   }
 
-  const NON_SPEND_CATS = new Set(["Money Received", "Top ups & Transfers"]);
+  // Build detailed MonthlySnapshots for each of the last 6 months (newest-first: Current Month, Sep 2026, Aug 2026, ...)
+  const monthlySnapshots: MonthlySnapshot[] = [];
 
-  // Build Pacing & Threshold flags + smart suggestions per category
-  const categoryPacing: CategoryPacingFlag[] = categories
-    .filter((c) => !NON_SPEND_CATS.has(c.name))
-    .map((c) => {
-      const limitMinor = c.monthlyAlertMinor ?? settings.alertThresholdMinor;
-      const hasCustomLimit = c.monthlyAlertMinor !== null;
-      const dailyArr = catDailySpend.get(c.id) ?? new Array<number>(totalDaysInMonth + 1).fill(0);
+  for (let i = 0; i <= 5; i++) {
+    let y = nowParts.year;
+    let m = nowParts.month - i;
+    while (m <= 0) {
+      m += 12;
+      y -= 1;
+    }
+    const mStart = zonedDate(y, m, 1, 0, 0, zone);
+    const mPeriod = monthPeriod(mStart, zone);
+    const mPrevPeriod = previousMonthPeriod(mStart, zone);
+    const mKey = formatInZone(mPeriod.start, "yyyy-MM", zone);
+    const mLabel = formatInZone(mPeriod.start, "MMMM yyyy", zone);
+    const mShortLabel = formatInZone(mPeriod.start, "MMM yyyy", zone);
+    const isCurrentMonth = i === 0;
+    const mDaysInMonth = daysInMonth(mStart, zone);
+    const mDaysElapsed = isCurrentMonth ? elapsed : mDaysInMonth;
 
-      let running = 0;
-      const dailyCumulative: DailyPacePoint[] = [];
-      for (let d = 1; d <= elapsed; d++) {
-        running += dailyArr[d];
-        const dateObj = zonedDate(nowParts.year, nowParts.month, d, 12, 0, zone);
-        dailyCumulative.push({
-          day: d,
-          dateLabel: formatInZone(dateObj, "d MMM", zone),
-          cumulativeMinor: Math.max(0, running),
-          proRataMinor: Math.round((limitMinor * d) / totalDaysInMonth),
-        });
-      }
+    const mHorizon = buildHorizon("month", mLabel, mShortLabel, mPeriod.start, mPeriod.end, mKey);
 
-      const spentMinor = Math.max(0, running);
-      const pctOfLimit = limitMinor > 0 ? Math.round((spentMinor / limitMinor) * 1000) / 10 : 0;
-      const latestTx = catLatestTxDate.get(c.id) ?? null;
-      const latestTxDay = latestTx ? zonedParts(latestTx, zone).day : elapsed;
-      const latestTxDateLabel = latestTx ? formatInZone(latestTx, "d MMM", zone) : null;
-      const proRataAtTxMinor = Math.round((limitMinor * latestTxDay) / totalDaysInMonth);
-
-      // Historical monthly spend for this category across the last 6 months
-      const activeMonthTotals: number[] = [];
-      for (const mBar of monthlySeries) {
-        const found = mBar.byCategory.find((x) => x.categoryId === c.id);
-        if (found && found.amountMinor > 0) {
-          activeMonthTotals.push(found.amountMinor);
+    // Compute comparison against preceding month (same days for current month, full preceding month for past months)
+    const compEnd = isCurrentMonth
+      ? new Date(Math.min(mPrevPeriod.start.getTime() + mDaysElapsed * 86_400_000, mPrevPeriod.end.getTime()))
+      : mPrevPeriod.end;
+    let prevComparisonMinor = 0;
+    const mPrevByCat = new Map<string | null, number>();
+    for (const tx of allConfirmedTxs) {
+      if (tx.occurredAt >= mPrevPeriod.start && tx.occurredAt < mPrevPeriod.end) {
+        const signed = tx.type === "refund" ? -tx.amountMinor : tx.amountMinor;
+        mPrevByCat.set(tx.categoryId, (mPrevByCat.get(tx.categoryId) ?? 0) + signed);
+        if (tx.occurredAt < compEnd) {
+          prevComparisonMinor += signed;
         }
       }
-      const lastMonthMinor = Math.max(0, prevFullByCat.get(c.id) ?? 0);
-      const avgMonthlyMinor =
-        activeMonthTotals.length > 0
-          ? Math.round(activeMonthTotals.reduce((a, b) => a + b, 0) / activeMonthTotals.length)
-          : spentMinor;
+    }
+    prevComparisonMinor = Math.max(0, prevComparisonMinor);
 
-      const basisMinor = lastMonthMinor > 0 ? Math.round((lastMonthMinor + avgMonthlyMinor) / 2) : avgMonthlyMinor;
-      const suggestedThresholdMinor = roundSuggestedMinor(basisMinor);
+    // Daily spend arrays for this month
+    const mOverallDaily = new Array<number>(mDaysInMonth + 1).fill(0);
+    const mCatDaily = new Map<string, number[]>();
+    const mCatLatestTx = new Map<string, Date>();
+    for (const c of spendCategories) {
+      mCatDaily.set(c.id, new Array<number>(mDaysInMonth + 1).fill(0));
+    }
 
-      let status: "over_limit" | "pacing_flag" | "on_track" = "on_track";
-      let flagMessage: string | null = null;
+    for (const tx of allConfirmedTxs) {
+      if (tx.occurredAt < mPeriod.start || tx.occurredAt >= mPeriod.end) continue;
+      const tp = zonedParts(tx.occurredAt, zone);
+      const dayNum = Math.min(mDaysInMonth, Math.max(1, tp.day));
+      const signed = tx.type === "refund" ? -tx.amountMinor : tx.amountMinor;
+      mOverallDaily[dayNum] += signed;
 
-      if (spentMinor > limitMinor) {
-        status = "over_limit";
-        flagMessage = `Exceeded monthly threshold (${pctOfLimit}% of limit) as of ${latestTxDateLabel ?? "today"}.`;
-      } else if (spentMinor > 0 && (spentMinor >= limitMinor * 0.5 || spentMinor > proRataAtTxMinor)) {
-        status = "pacing_flag";
-        flagMessage = `${pctOfLimit}% of monthly threshold spent by ${latestTxDateLabel ?? `Oct ${latestTxDay}`} (ahead of day-${latestTxDay} pace).`;
+      if (tx.categoryId && mCatDaily.has(tx.categoryId)) {
+        mCatDaily.get(tx.categoryId)![dayNum] += signed;
+        const prevLatest = mCatLatestTx.get(tx.categoryId);
+        if (!prevLatest || tx.occurredAt > prevLatest) {
+          mCatLatestTx.set(tx.categoryId, tx.occurredAt);
+        }
       }
+    }
 
-      return {
-        categoryId: c.id,
-        name: c.name,
-        color: c.color,
-        spentMinor,
-        limitMinor,
-        hasCustomLimit,
-        pctOfLimit,
-        latestTxDateLabel,
-        latestTxDay,
-        proRataAtTxMinor,
-        status,
-        flagMessage,
-        lastMonthMinor,
-        avgMonthlyMinor,
-        suggestedThresholdMinor,
-        dailyCumulative,
-      };
-    })
-    .sort((a, b) => b.spentMinor - a.spentMinor);
+    // Build per-category threshold & pacing for this month
+    const mCategoryPacing: CategoryPacingFlag[] = spendCategories
+      .map((c) => {
+        const resolved = resolvedThresholds.get(`${c.id}::${mKey}`);
+        const limitMinor = resolved?.limitMinor ?? c.monthlyAlertMinor ?? settings.alertThresholdMinor;
+        const thresholdComment = resolved?.comment ?? "threshold testing and adjustment";
+        const thresholdUpdatedAt = resolved?.updatedAt ?? null;
+        const hasCustomLimit = c.monthlyAlertMinor !== null || budgetMap.has(`${c.id}::${mKey}`);
+        const dailyArr = mCatDaily.get(c.id) ?? new Array<number>(mDaysInMonth + 1).fill(0);
 
-  // Build overall daily cumulative points
-  const overallLimitMinor = categoryPacing.reduce((acc, c) => acc + c.limitMinor, 0) || settings.alertThresholdMinor;
-  let overallRunning = 0;
-  const overallDailyCumulative: DailyPacePoint[] = [];
-  for (let d = 1; d <= elapsed; d++) {
-    overallRunning += overallDailySpend[d];
-    const dateObj = zonedDate(nowParts.year, nowParts.month, d, 12, 0, zone);
-    overallDailyCumulative.push({
-      day: d,
-      dateLabel: formatInZone(dateObj, "d MMM", zone),
-      cumulativeMinor: Math.max(0, overallRunning),
-      proRataMinor: Math.round((overallLimitMinor * d) / totalDaysInMonth),
+        let running = 0;
+        const dailyCumulative: DailyPacePoint[] = [];
+        for (let d = 1; d <= mDaysElapsed; d++) {
+          running += dailyArr[d];
+          const dateObj = zonedDate(y, m, d, 12, 0, zone);
+          dailyCumulative.push({
+            day: d,
+            dateLabel: formatInZone(dateObj, "d MMM", zone),
+            cumulativeMinor: Math.max(0, running),
+            proRataMinor: Math.round((limitMinor * d) / mDaysInMonth),
+          });
+        }
+
+        const spentMinor = Math.max(0, running);
+        const pctOfLimit = limitMinor > 0 ? Math.round((spentMinor / limitMinor) * 1000) / 10 : 0;
+        const varianceMinor = limitMinor - spentMinor;
+        const latestTx = mCatLatestTx.get(c.id) ?? null;
+        const latestTxDay = latestTx ? zonedParts(latestTx, zone).day : mDaysElapsed;
+        const latestTxDateLabel = latestTx ? formatInZone(latestTx, "d MMM", zone) : null;
+        const proRataAtTxMinor = Math.round((limitMinor * latestTxDay) / mDaysInMonth);
+
+        const lastMonthMinor = Math.max(0, mPrevByCat.get(c.id) ?? 0);
+        const avgMonthlyMinor = catHistoricalAvg.get(c.id) || spentMinor;
+        const basisMinor = lastMonthMinor > 0 ? Math.round((lastMonthMinor + avgMonthlyMinor) / 2) : avgMonthlyMinor;
+        const suggestedThresholdMinor = roundSuggestedMinor(basisMinor);
+
+        let status: "over_limit" | "pacing_flag" | "on_track" = "on_track";
+        let flagMessage: string | null = null;
+
+        if (spentMinor > limitMinor) {
+          status = "over_limit";
+          flagMessage = isCurrentMonth
+            ? `Exceeded monthly threshold (${pctOfLimit}% of limit) as of ${latestTxDateLabel ?? "today"}.`
+            : `Ended ${mShortLabel} at ${pctOfLimit}% of threshold (exceeded by $${Math.round((spentMinor - limitMinor) / 100).toLocaleString("en-HK")}).`;
+        } else if (
+          isCurrentMonth &&
+          spentMinor > 0 &&
+          (spentMinor >= limitMinor * 0.5 || spentMinor > proRataAtTxMinor)
+        ) {
+          status = "pacing_flag";
+          flagMessage = `${pctOfLimit}% of monthly threshold spent by ${latestTxDateLabel ?? `Day ${latestTxDay}`} (ahead of day-${latestTxDay} pace).`;
+        } else if (!isCurrentMonth && spentMinor >= limitMinor * 0.85) {
+          status = "pacing_flag";
+          flagMessage = `Used ${pctOfLimit}% of ${mShortLabel} threshold ($${Math.round(varianceMinor / 100).toLocaleString("en-HK")} remaining).`;
+        }
+
+        return {
+          categoryId: c.id,
+          name: c.name,
+          color: c.color,
+          spentMinor,
+          limitMinor,
+          hasCustomLimit,
+          pctOfLimit,
+          varianceMinor,
+          latestTxDateLabel,
+          latestTxDay,
+          proRataAtTxMinor,
+          status,
+          flagMessage,
+          lastMonthMinor,
+          avgMonthlyMinor,
+          suggestedThresholdMinor,
+          thresholdComment,
+          thresholdUpdatedAt,
+          dailyCumulative,
+        };
+      })
+      .sort((a, b) => b.spentMinor - a.spentMinor);
+
+    const mOverallLimitMinor =
+      mCategoryPacing.reduce((acc, c) => acc + c.limitMinor, 0) || settings.alertThresholdMinor;
+    let overallRunning = 0;
+    const mOverallDailyCumulative: DailyPacePoint[] = [];
+    for (let d = 1; d <= mDaysElapsed; d++) {
+      overallRunning += mOverallDaily[d];
+      const dateObj = zonedDate(y, m, d, 12, 0, zone);
+      mOverallDailyCumulative.push({
+        day: d,
+        dateLabel: formatInZone(dateObj, "d MMM", zone),
+        cumulativeMinor: Math.max(0, overallRunning),
+        proRataMinor: Math.round((mOverallLimitMinor * d) / mDaysInMonth),
+      });
+    }
+
+    // Identify "Spending Surge vs. Past Avg" (better name for "unusually high category from past data")
+    let surgeCategory: SpendingSurgeCategory | null = null;
+    for (const cp of mCategoryPacing) {
+      if (cp.spentMinor <= 0) continue;
+      // Compute baseline from other months in the 6-month window
+      const otherMonthsTotals: number[] = [];
+      for (const bar of monthlySeries) {
+        if (bar.key === mKey) continue;
+        const found = bar.byCategory.find((x) => x.categoryId === cp.categoryId);
+        if (found && found.amountMinor > 0) {
+          otherMonthsTotals.push(found.amountMinor);
+        }
+      }
+      const baselineFullMonth =
+        otherMonthsTotals.length > 0
+          ? Math.round(otherMonthsTotals.reduce((a, b) => a + b, 0) / otherMonthsTotals.length)
+          : cp.lastMonthMinor || cp.avgMonthlyMinor;
+
+      // For current month, compare against pro-rated historical baseline for the elapsed days (or full month if already higher)
+      const baselineForComparison = isCurrentMonth
+        ? Math.max(1, Math.round((baselineFullMonth * Math.max(7, mDaysElapsed)) / mDaysInMonth))
+        : baselineFullMonth;
+
+      if (baselineForComparison <= 0) continue;
+      const deltaMinor = cp.spentMinor - baselineForComparison;
+      const surgePct = Math.round((deltaMinor / baselineForComparison) * 100);
+
+      if (
+        deltaMinor > 0 &&
+        (!surgeCategory || surgePct > surgeCategory.surgePct || deltaMinor > surgeCategory.deltaMinor)
+      ) {
+        surgeCategory = {
+          categoryId: cp.categoryId,
+          name: cp.name,
+          color: cp.color,
+          spentMinor: cp.spentMinor,
+          historicalAvgMinor: baselineFullMonth,
+          deltaMinor,
+          surgePct,
+          summaryText: isCurrentMonth
+            ? `+${surgePct}% vs usual pace ($${Math.round(baselineFullMonth / 100).toLocaleString("en-HK")}/mo avg)`
+            : `+${surgePct}% above usual $${Math.round(baselineFullMonth / 100).toLocaleString("en-HK")}/mo avg`,
+        };
+      }
+    }
+
+    monthlySnapshots.push({
+      monthKey: mKey,
+      label: mLabel,
+      shortLabel: mShortLabel,
+      isCurrentMonth,
+      daysElapsed: mDaysElapsed,
+      daysInMonth: mDaysInMonth,
+      totalMinor: mHorizon.totalMinor,
+      prevComparisonMinor,
+      transactionCount: mHorizon.transactionCount,
+      avgPerDayMinor: Math.round(mHorizon.totalMinor / Math.max(1, mDaysElapsed)),
+      overallLimitMinor: mOverallLimitMinor,
+      topCategory: mHorizon.topCategory,
+      topSubcategory: mHorizon.topSubcategory,
+      surgeCategory,
+      byCategory: mHorizon.byCategory,
+      bySubcategory: mHorizon.bySubcategory,
+      categoryPacing: mCategoryPacing,
+      overallDailyCumulative: mOverallDailyCumulative,
     });
   }
+
+  const currentSnapshot = monthlySnapshots[0];
+  const categoryPacing = currentSnapshot.categoryPacing;
+  const overallDailyCumulative = currentSnapshot.overallDailyCumulative;
+  const overallLimitMinor = currentSnapshot.overallLimitMinor;
 
   const strategy = strategyFromRule(alertRule);
   const byCategory = horizons.month.byCategory.map((c) => {
@@ -522,24 +833,33 @@ export async function getOverview(settings: AppSettings, now = new Date()) {
   const daysSinceImport = lastImportAt ? Math.floor((now.getTime() - lastImportAt.getTime()) / 86_400_000) : null;
   const pending = pendingAgg._count._all;
   const pendingTotalMinor = pendingAgg._sum.amountMinor ?? 0;
+  const daysRemainingInMonth = Math.max(0, totalDaysInMonth - elapsed);
+  const isEndOfMonthReminderDue = daysRemainingInMonth <= 5 || elapsed <= 3;
 
   return {
     month,
+    currentMonthKey,
     elapsed,
     daysInMonth: totalDaysInMonth,
+    daysRemainingInMonth,
+    isEndOfMonthReminderDue,
     totalMinor,
     prevSameDaysMinor,
     transactionCount,
     avgPerDayMinor: Math.round(totalMinor / Math.max(1, elapsed)),
     topCategory: byCategory[0] ?? null,
+    surgeCategory: currentSnapshot.surgeCategory,
     byCategory,
     alerts: byCategory.map((c) => c.alert).filter((a): a is CategoryAlert => a !== null),
     horizons,
     weeklySeries,
     monthlySeries,
+    monthlySnapshots,
+    thresholdLogs,
     categoryPacing,
     overallDailyCumulative,
     overallLimitMinor,
+    spendCategories: spendCategories.map((c) => ({ id: c.id, name: c.name, color: c.color })),
     pending,
     pendingTotalMinor,
     recent,
