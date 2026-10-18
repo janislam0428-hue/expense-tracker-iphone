@@ -13,6 +13,7 @@
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
     "db:deploy": "tsx scripts/db-deploy.ts",
+    "taxonomy:migrate": "tsx scripts/migrate-taxonomy.ts",
     "db:reset": "prisma migrate reset --force && tsx prisma/seed.ts",
     "postinstall": "prisma generate"
   },
@@ -52,6 +53,12 @@
     "vitest": "^4.1.11"
   },
   "engines": {
-    "node": ">=20.19"
+    "node": "22.x"
+  },
+  "allowScripts": {
+    "@prisma/engines": true,
+    "esbuild": true,
+    "prisma": true,
+    "unrs-resolver": true
   }
 }

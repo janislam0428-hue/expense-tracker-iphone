@@ -9,6 +9,44 @@ import { normalizeMerchant, shortHash } from "@/lib/text";
 import { formatInZone, zonedDate } from "@/lib/time";
 import { decideReview } from "@/lib/review/rules";
 
+function cleanOcrMerchantName(input: string): string {
+  if (!input) return "";
+  return input
+    .normalize("NFKC")
+    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalizeMerchantKey(input: string): string {
+  return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
+    .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
+    .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
+    .replace(/\bwel+come\b/g, "wellcome")
+    .replace(/\bminibuses\b/g, "minibus")
+    .replace(/\bbuses\b/g, "bus")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
+  const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
+  const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
+  if (!normMerchant || !normRule) return false;
+  if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
+    return true;
+  }
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule) return false;
+  return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
+}
+
 const txFormSchema = z.object({
   id: z.string().optional(),
   amount: z
@@ -47,7 +85,8 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
   const d = parsed.data;
   const settings = await db.settings.findUniqueOrThrow({ where: { id: 1 } });
   const amountMinor = toMinor(d.amount);
-  const merchantNormalized = normalizeMerchant(d.merchant);
+  const cleanedMerchant = cleanOcrMerchantName(d.merchant) || d.merchant;
+  const merchantNormalized = normalizeMerchant(cleanedMerchant);
   const occurredAt = parseLocalDateTime(d.occurredAt, settings.timezone) ?? new Date();
 
   const category = d.categoryId ? await db.category.findUnique({ where: { id: d.categoryId } }) : null;
@@ -74,7 +113,7 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
       datePrecision: "minute",
       amountMinor,
       currency: settings.currency,
-      merchant: d.merchant,
+      merchant: cleanedMerchant,
       merchantNormalized,
       categoryId: category?.id ?? null,
       subcategoryId: subcategory?.id ?? null,
@@ -91,7 +130,7 @@ export async function addTransaction(_prev: ActionState, formData: FormData): Pr
   });
 
   revalidatePath("/", "layout");
-  return { ok: `Added ${d.merchant} (${settings.currency} ${d.amount})` };
+  return { ok: `Added ${cleanedMerchant} (${settings.currency} ${d.amount})` };
 }
 
 export async function updateTransaction(_prev: ActionState, formData: FormData): Promise<ActionState> {
@@ -107,7 +146,8 @@ export async function updateTransaction(_prev: ActionState, formData: FormData):
   if (!existing) return { error: "Transaction not found" };
 
   const amountMinor = toMinor(d.amount);
-  const merchantNormalized = normalizeMerchant(d.merchant);
+  const cleanedMerchant = cleanOcrMerchantName(d.merchant) || d.merchant;
+  const merchantNormalized = normalizeMerchant(cleanedMerchant);
   const occurredAt = parseLocalDateTime(d.occurredAt, settings.timezone) ?? existing.occurredAt;
 
   const category =
@@ -122,7 +162,7 @@ export async function updateTransaction(_prev: ActionState, formData: FormData):
   await db.transaction.update({
     where: { id: d.id },
     data: {
-      merchant: d.merchant,
+      merchant: cleanedMerchant,
       merchantNormalized,
       amountMinor,
       occurredAt,
@@ -138,8 +178,61 @@ export async function updateTransaction(_prev: ActionState, formData: FormData):
     },
   });
 
+  if (category) {
+    const rulePattern = canonicalizeMerchantKey(cleanedMerchant) || merchantNormalized;
+    if (rulePattern) {
+      const existingRules = await db.merchantRule.findMany({ where: { isDemo: existing.isDemo } });
+      const matchedRule = existingRules.find(
+        (r) => r.pattern.toLowerCase().trim() === rulePattern || doesMerchantMatchRule(cleanedMerchant, r.pattern),
+      );
+      if (!matchedRule) {
+        await db.merchantRule.create({
+          data: {
+            pattern: rulePattern,
+            matchType: "contains",
+            categoryId: subcategory?.id ?? category.id,
+            hits: 1,
+            lastUsedAt: new Date(),
+            isDemo: existing.isDemo,
+          },
+        });
+      } else {
+        await db.merchantRule.update({
+          where: { id: matchedRule.id },
+          data: {
+            categoryId: subcategory?.id ?? category.id,
+            hits: { increment: 1 },
+            lastUsedAt: new Date(),
+          },
+        });
+      }
+
+      const others = await db.transaction.findMany({
+        where: {
+          isDemo: existing.isDemo,
+          id: { not: d.id },
+          OR: [{ categoryId: null }, { purposeStatus: "needs_review" }],
+        },
+        select: { id: true, merchant: true, amountMinor: true, counterparty: true },
+      });
+
+      const matchingOthers = others.filter((t) => doesMerchantMatchRule(t.merchant, rulePattern));
+      for (const other of matchingOthers) {
+        const shouldConfirm = other.amountMinor <= settings.reviewThresholdMinor && !other.counterparty;
+        await db.transaction.update({
+          where: { id: other.id },
+          data: {
+            categoryId: category.id,
+            subcategoryId: subcategory?.id ?? null,
+            ...(shouldConfirm ? { purposeStatus: "confirmed", reviewReasons: "[]" } : {}),
+          },
+        });
+      }
+    }
+  }
+
   revalidatePath("/", "layout");
-  return { ok: `Updated ${d.merchant}` };
+  return { ok: `Updated ${cleanedMerchant}` };
 }
 
 export async function deleteTransaction(id: string): Promise<ActionState> {
