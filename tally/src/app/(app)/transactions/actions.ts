@@ -9,11 +9,38 @@ import { normalizeMerchant, shortHash } from "@/lib/text";
 import { formatInZone, zonedDate } from "@/lib/time";
 import { decideReview } from "@/lib/review/rules";
 
+const GENERIC_RULE_BLACKLIST = new Set([
+  "octopus",
+  "octopus 1",
+  "octopus 2",
+  "octopus purchase",
+  "purchase",
+  "payme",
+  "hang seng",
+  "hang seng card",
+  "visa",
+  "mastercard",
+  "八達通",
+]);
+
 function cleanOcrMerchantName(input: string): string {
   if (!input) return "";
   return input
     .normalize("NFKC")
-    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /(?:^|\s)[<‹＜«←⬅️⌃^]*\s*(?:octopus|八達通)(?:\s+\d+)?\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/gi,
+      " ",
+    )
+    .replace(
+      /^[<‹＜«←⬅️]+\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/i,
+      "",
+    )
+    .replace(
+      /^(?:octopus|八達通)\s+\d+(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?(?:\s+|$)/i,
+      "",
+    )
+    .replace(/(?:^|\s)[<‹＜«←⬅️]*\s*\b\d{7,12}\s*[\(\[\{]\d+[\)\]\}]?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/g, " ")
+    .replace(/^[<‹＜«←⬅️•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
     .replace(
       /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
       "",
@@ -24,6 +51,8 @@ function cleanOcrMerchantName(input: string): string {
 
 function canonicalizeMerchantKey(input: string): string {
   return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s+\d+)?)?\s*/i, "")
+    .replace(/\b\d{7,12}\b/g, " ")
     .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
     .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
     .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
@@ -37,13 +66,17 @@ function canonicalizeMerchantKey(input: string): string {
 function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
   const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
   const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
-  if (!normMerchant || !normRule) return false;
+  if (!normMerchant || !normRule || normRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(normMerchant) || GENERIC_RULE_BLACKLIST.has(normRule)) return false;
+
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule || canonRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(canonMerchant) || GENERIC_RULE_BLACKLIST.has(canonRule)) return false;
+
   if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
     return true;
   }
-  const canonMerchant = canonicalizeMerchantKey(merchant);
-  const canonRule = canonicalizeMerchantKey(rulePattern);
-  if (!canonMerchant || !canonRule) return false;
   return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
 }
 
@@ -180,7 +213,7 @@ export async function updateTransaction(_prev: ActionState, formData: FormData):
 
   if (category) {
     const rulePattern = canonicalizeMerchantKey(cleanedMerchant) || merchantNormalized;
-    if (rulePattern) {
+    if (rulePattern && rulePattern.length >= 2 && !GENERIC_RULE_BLACKLIST.has(rulePattern)) {
       const existingRules = await db.merchantRule.findMany({ where: { isDemo: existing.isDemo } });
       const matchedRule = existingRules.find(
         (r) => r.pattern.toLowerCase().trim() === rulePattern || doesMerchantMatchRule(cleanedMerchant, r.pattern),
@@ -200,6 +233,7 @@ export async function updateTransaction(_prev: ActionState, formData: FormData):
         await db.merchantRule.update({
           where: { id: matchedRule.id },
           data: {
+            pattern: rulePattern,
             categoryId: subcategory?.id ?? category.id,
             hits: { increment: 1 },
             lastUsedAt: new Date(),
@@ -218,10 +252,13 @@ export async function updateTransaction(_prev: ActionState, formData: FormData):
 
       const matchingOthers = others.filter((t) => doesMerchantMatchRule(t.merchant, rulePattern));
       for (const other of matchingOthers) {
+        const cleanOtherMerchant = cleanOcrMerchantName(other.merchant) || other.merchant;
         const shouldConfirm = other.amountMinor <= settings.reviewThresholdMinor && !other.counterparty;
         await db.transaction.update({
           where: { id: other.id },
           data: {
+            merchant: cleanOtherMerchant,
+            merchantNormalized: normalizeMerchant(cleanOtherMerchant),
             categoryId: category.id,
             subcategoryId: subcategory?.id ?? null,
             ...(shouldConfirm ? { purposeStatus: "confirmed", reviewReasons: "[]" } : {}),

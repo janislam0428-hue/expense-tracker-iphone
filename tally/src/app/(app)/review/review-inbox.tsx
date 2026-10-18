@@ -13,11 +13,38 @@ import { formatInZone } from "@/lib/time";
 import { REVIEW_REASONS, parseJsonArray, type ReviewReason } from "@/lib/domain";
 import { confirmPurpose, confirmAllAsPersonal, deletePendingTransaction } from "./actions";
 
+const GENERIC_RULE_BLACKLIST = new Set([
+  "octopus",
+  "octopus 1",
+  "octopus 2",
+  "octopus purchase",
+  "purchase",
+  "payme",
+  "hang seng",
+  "hang seng card",
+  "visa",
+  "mastercard",
+  "八達通",
+]);
+
 function cleanOcrMerchantName(input: string): string {
   if (!input) return "";
   return input
     .normalize("NFKC")
-    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /(?:^|\s)[<‹＜«←⬅️⌃^]*\s*(?:octopus|八達通)(?:\s+\d+)?\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/gi,
+      " ",
+    )
+    .replace(
+      /^[<‹＜«←⬅️]+\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/i,
+      "",
+    )
+    .replace(
+      /^(?:octopus|八達通)\s+\d+(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?(?:\s+|$)/i,
+      "",
+    )
+    .replace(/(?:^|\s)[<‹＜«←⬅️]*\s*\b\d{7,12}\s*[\(\[\{]\d+[\)\]\}]?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/g, " ")
+    .replace(/^[<‹＜«←⬅️•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
     .replace(
       /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
       "",
@@ -28,6 +55,8 @@ function cleanOcrMerchantName(input: string): string {
 
 function canonicalizeMerchantKey(input: string): string {
   return normalizeMerchant(cleanOcrMerchantName(input))
+    .replace(/^(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s+\d+)?)?\s*/i, "")
+    .replace(/\b\d{7,12}\b/g, " ")
     .replace(/^(?:cup|visa|master|mastercard|amex|unionpay)\s+/i, "")
     .replace(/^(?:kpay|bbmsl|qfpay|yedpay|stripe|sq|paypal|alipay|wechat|shopify|adyen)\s+/i, "")
     .replace(/\b(?:group\s+limited|holdings?\s+limited|company\s+limited|co\s+ltd|limited|ltd|inc|corp|corporation)\b/g, " ")
@@ -41,13 +70,17 @@ function canonicalizeMerchantKey(input: string): string {
 function doesMerchantMatchRule(merchant: string, rulePattern: string): boolean {
   const normMerchant = normalizeMerchant(cleanOcrMerchantName(merchant));
   const normRule = normalizeMerchant(cleanOcrMerchantName(rulePattern));
-  if (!normMerchant || !normRule) return false;
+  if (!normMerchant || !normRule || normRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(normMerchant) || GENERIC_RULE_BLACKLIST.has(normRule)) return false;
+
+  const canonMerchant = canonicalizeMerchantKey(merchant);
+  const canonRule = canonicalizeMerchantKey(rulePattern);
+  if (!canonMerchant || !canonRule || canonRule.length < 2) return false;
+  if (GENERIC_RULE_BLACKLIST.has(canonMerchant) || GENERIC_RULE_BLACKLIST.has(canonRule)) return false;
+
   if (normMerchant.includes(normRule) || (normRule.length >= 3 && normRule.includes(normMerchant))) {
     return true;
   }
-  const canonMerchant = canonicalizeMerchantKey(merchant);
-  const canonRule = canonicalizeMerchantKey(rulePattern);
-  if (!canonMerchant || !canonRule) return false;
   return canonMerchant.includes(canonRule) || (canonRule.length >= 3 && canonRule.includes(canonMerchant));
 }
 
@@ -110,7 +143,7 @@ export function ReviewInbox({
       setEdits((prev) => ({
         ...prev,
         [tx.id]: {
-          merchant: tx.merchant,
+          merchant: cleanOcrMerchantName(tx.merchant) || tx.merchant,
           amount: (tx.amountMinor / 100).toFixed(2),
           occurredAt: formatInZone(tx.occurredAt, "yyyy-MM-dd'T'HH:mm", zone),
           description: [tx.location, tx.description].filter(Boolean).join(" · "),
@@ -135,7 +168,8 @@ export function ReviewInbox({
     categoryId: string,
     subcategoryId: string | null,
   ) => {
-    const sourceMerchant = edits[sourceTx.id]?.merchant?.trim() || sourceTx.merchant;
+    const rawSourceMerchant = edits[sourceTx.id]?.merchant?.trim() || sourceTx.merchant;
+    const sourceMerchant = cleanOcrMerchantName(rawSourceMerchant) || rawSourceMerchant;
     const matchedCat = categories.find((c) => c.id === categoryId);
 
     setClassifications((prev) => {
@@ -187,7 +221,7 @@ export function ReviewInbox({
     const txId = tx.id;
     const saveRule = !!rememberRules[txId];
     const draft = edits[txId];
-    const displayMerchant = draft?.merchant?.trim() || tx.merchant;
+    const displayMerchant = cleanOcrMerchantName(draft?.merchant?.trim() || tx.merchant) || tx.merchant;
 
     startTransition(async () => {
       const selection = classifications[txId] ?? {
@@ -325,7 +359,7 @@ export function ReviewInbox({
             subcategoryId: tx.subcategoryId,
           };
           const selectedCategory = categories.find((c) => c.id === selection.categoryId);
-          const displayMerchant = draft?.merchant || tx.merchant;
+          const displayMerchant = draft?.merchant || cleanOcrMerchantName(tx.merchant) || tx.merchant;
 
           return (
             <div

@@ -4,6 +4,9 @@
 //  2. Apple Wallet & Lock Screen Octopus notifications & "Latest Transactions" screenshots
 //  3. PayMe App transaction history screenshots & Gmail App / Apple Mail (popup banners, inbox list, and opened emails)
 //  4. Hang Seng Bank App transaction history screenshots & e-Alert emails/banners
+// Automatically filters out remaining balances, Octopus card header numbers ("< Octopus 1 192116091(2)"),
+// Octopus top-ups ("Octopus Cards Limited +600.0", "APPLEPAY OCTOPUS CAR"),
+// and PayMe bank top-ups ("LAM JANIS SZE YUET HKDD5326818092", "Hang Seng Bank Lim... **0882").
 
 import { normalizeMerchant } from "@/lib/text";
 import { addZonedDays, zonedDate, zonedParts } from "@/lib/time";
@@ -29,22 +32,6 @@ export type ParsedNotification = {
   confidence: number;
   rawText: string;
 };
-
-/**
- * Strips leading OCR icon misreads (e.g. "印 Green Minibuses" -> "Green Minibuses", "印 MTR Corporation Limited" -> "MTR Corporation Limited").
- */
-export function cleanOcrMerchantName(input: string): string {
-  if (!input) return "";
-  return input
-    .normalize("NFKC")
-    .replace(/^[•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
-    .replace(
-      /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
-      "",
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 const WEEKDAY_INDEX: Record<string, number> = {
   sun: 0,
@@ -107,19 +94,66 @@ const MONTH_INDEX: Record<string, number> = {
   december: 12,
 };
 
+/**
+ * Strips Octopus App card header/account numbers (e.g. "< Octopus 1 192116091(2)")
+ * and leading OCR icon artifacts (e.g. "印 Green Minibuses" -> "Green Minibuses").
+ */
+export function cleanOcrMerchantName(input: string): string {
+  if (!input) return "";
+  return input
+    .normalize("NFKC")
+    .replace(
+      /(?:^|\s)[<‹＜«←⬅️⌃^]*\s*(?:octopus|八達通)(?:\s+\d+)?\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/gi,
+      " ",
+    )
+    .replace(
+      /^[<‹＜«←⬅️]+\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/i,
+      "",
+    )
+    .replace(
+      /^(?:octopus|八達通)\s+\d+(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?(?:\s+|$)/i,
+      "",
+    )
+    .replace(/(?:^|\s)[<‹＜«←⬅️]*\s*\b\d{7,12}\s*[\(\[\{]\d+[\)\]\}]?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/g, " ")
+    .replace(/^[<‹＜«←⬅️•·▪▫◦●○■□▲△▼▽◆◇★☆⊕⊗⊙⊚⊛⊜⊝⊞⊟⊠⊡]+\s*/u, "")
+    .replace(
+      /^(?:[印日目甲由申田口回囚四皿且貝見頁車凸凹尚向同团因固國圖片币巾中内肉門間問開関]\s+|[印日目甲由申田口回囚四皿且貝見頁凸凹](?=[A-Za-z]))/u,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Checks whether a merchant name is a generic placeholder from Apple Wallet / Express Transit
+ * rather than an authoritative merchant name from the Octopus App.
+ */
 export function isGenericWalletMerchant(merchant: string): boolean {
-  const m = normalizeMerchant(cleanOcrMerchantName(merchant));
+  const m = normalizeMerchant(merchant);
   return /^(?:octopus purchase|octopus|purchase|bus|train|transit|minibus|ferry|tram|light rail|public transport|八達通|零售|消費|付款)$/.test(
     m,
   );
 }
 
+/**
+ * Checks whether a line is a balance statement (e.g. "Your new balance is HK$133.60.")
+ * so it is NEVER mistaken for a spending transaction.
+ */
 export function isBalanceLine(line: string): boolean {
   return /\b(?:your new balance|new balance|remaining balance|available balance|account balance|balance is|balance:|餘額|結餘)\b/i.test(
     line,
   );
 }
 
+/**
+ * Checks whether a line or merchant is a top-up / reload / self-funding transfer:
+ * - Explicit "+ 655.40", "+600.0", or "+HK$100.00"
+ * - "Top up", "Add value", "Reload", "Auto top-up", "AAV", "增值", "自動增值"
+ * - Octopus App AAVS / reload merchant: "Octopus Cards Limited"
+ * - Hang Seng -> PayMe direct debit top-ups: "LAM JANIS SZE YUET", "HKDD5326818092", "HKDD..."
+ * - Hang Seng / Apple Pay -> Octopus top-ups: "APPLEPAY OCTOPUS", "OCTOPUS CAR", "OCTOPUS CARD"
+ * - PayMe bank top-up subtitle: "Hang Seng Bank Lim... **0882"
+ */
 export function isTopUpLine(line: string): boolean {
   const s = line.trim();
   if (/^\+\s*(?:HKD|HK\$|\$)?\s*[0-9,]+(?:\.[0-9]{1,2})?(?:\s*HKD)?$/i.test(s)) return true;
@@ -132,6 +166,9 @@ export function isTopUpLine(line: string): boolean {
   return false;
 }
 
+/**
+ * Extracts balance in minor units from a balance line if present.
+ */
 function extractBalanceMinor(line: string): number | undefined {
   if (!isBalanceLine(line)) return undefined;
   const m = line.match(/(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i);
@@ -139,6 +176,12 @@ function extractBalanceMinor(line: string): number | undefined {
   return Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
 }
 
+/**
+ * Resolves any date, relative weekday, bank date code ("14OCT"), or timestamp label into a concrete Date in Hong Kong time:
+ * - Explicit dates (>1 week ago): "2026-09-27 16:53", "2026-10-07", "23:50 10/10/2026", "7 Oct 2026", "14OCT", "10月7日"
+ * - Weekdays (within past 7 days): "Tuesday", "Wednesday", "Thu 18:56", "Wed 22:34"
+ * - Relative offsets: "1h ago", "25m ago", "Today", "Yesterday", "15:33"
+ */
 export function resolveRelativeDay(
   label: string | null | undefined,
   refDate = new Date(),
@@ -150,6 +193,7 @@ export function resolveRelativeDay(
   const p = zonedParts(refDate);
   const minuteOffset = Math.max(0, 59 - itemIndex);
 
+  // 1. Explicit ISO date: YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD (with optional HH:mm before or after)
   let m = raw.match(
     /(?:(\d{1,2}):(\d{2})\s+)?\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/,
   );
@@ -168,6 +212,7 @@ export function resolveRelativeDay(
     };
   }
 
+  // 2. Explicit DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY (with optional HH:mm before or after, e.g. "23:50 10/10/2026")
   m = raw.match(
     /(?:(\d{1,2}):(\d{2})\s+)?\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-](20\d{2}|\d{2})(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/,
   );
@@ -187,6 +232,7 @@ export function resolveRelativeDay(
     };
   }
 
+  // 3. Explicit Chinese date: "2026年10月7日" or "10月7日"
   m = raw.match(/(?:(20\d{2})年)?\s*(0?[1-9]|1[0-2])月\s*(0?[1-9]|[12]\d|3[01])[日號]?(?:\s*(\d{1,2}):(\d{2}))?/);
   if (m) {
     const year = m[1] ? parseInt(m[1], 10) : p.year;
@@ -201,6 +247,8 @@ export function resolveRelativeDay(
     };
   }
 
+  // 4. Explicit Month Name date or attached bank date code:
+  //    "7 Oct 2026", "08 Oct 2026", "14OCT", "11OCT", "Oct 7, 2026"
   m =
     raw.match(
       /\b(?:mon|tue|wed|thu|fri|sat|sun)?\s*,?\s*(0?[1-9]|[12]\d|3[01])\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*(?:\s*,?\s*(20\d{2}))?(?:\s*,?\s*(\d{1,2}):(\d{2}))?\b/i,
@@ -223,6 +271,7 @@ export function resolveRelativeDay(
     };
   }
 
+  // 5. Relative offset: "1h ago", "2 hr ago", "15m ago", "30 min ago"
   const agoMatch = clean.match(/\b(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\s*ago\b/i);
   if (agoMatch) {
     const val = parseInt(agoMatch[1], 10);
@@ -232,6 +281,7 @@ export function resolveRelativeDay(
     return { date: zonedDate(tp.year, tp.month, tp.day, tp.hour, tp.minute), precision: "minute" };
   }
 
+  // 6. Weekday + HH:mm (e.g. "Thu 18:56", "Wed 22:34", "Yesterday 14:20", "Today 09:15")
   const dayTimeMatch = clean.match(
     /\b(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|yesterday|今日|昨日|週[一二三四五六日]|星期[一二三四五六日])\s*,?\s*(\d{1,2}):(\d{2})\b/i,
   );
@@ -257,6 +307,7 @@ export function resolveRelativeDay(
     }
   }
 
+  // 7. Time only: "15:33", "09:12" -> Today at HH:mm
   const timeOnlyMatch = clean.match(/^(\d{1,2}):(\d{2})$/);
   if (timeOnlyMatch) {
     const hour = parseInt(timeOnlyMatch[1], 10);
@@ -264,6 +315,7 @@ export function resolveRelativeDay(
     return { date: zonedDate(p.year, p.month, p.day, hour, minute), precision: "minute" };
   }
 
+  // 8. "Today" / "Yesterday" / "now"
   if (clean === "today" || clean === "now" || clean === "今日" || clean === "今天") {
     return { date: zonedDate(p.year, p.month, p.day, 12, minuteOffset), precision: "date_only" };
   }
@@ -272,6 +324,7 @@ export function resolveRelativeDay(
     return { date: yest, precision: "date_only" };
   }
 
+  // 9. Standalone weekday ("Tuesday", "Wednesday", "Thursday") -> within the past 7 days
   const targetDow = WEEKDAY_INDEX[clean];
   if (targetDow !== undefined) {
     let diff = (p.weekday - targetDow + 7) % 7;
@@ -283,6 +336,9 @@ export function resolveRelativeDay(
   return { date: new Date(refDate.getTime() - itemIndex * 1000), precision: "minute" };
 }
 
+/**
+ * Checks if a string is purely a date, weekday, or timestamp (and NOT a merchant name).
+ */
 export function isDateOrTimestampLabel(text: string): boolean {
   const s = text.trim().replace(/^(?:Octopus|Wallet|Apple Pay|PayMe(?: by HSBC)?|Gmail)\s+/i, "").trim();
   if (!s) return false;
@@ -318,6 +374,9 @@ export function isDateOrTimestampLabel(text: string): boolean {
   return false;
 }
 
+/**
+ * Extracts any embedded date/time label from a line and returns both the date label and the remaining merchant text.
+ */
 function splitDateFromText(line: string): { dateLabel: string | null; remainingText: string } {
   const s = line.trim();
   if (isDateOrTimestampLabel(s)) {
@@ -356,28 +415,71 @@ function splitDateFromText(line: string): { dateLabel: string | null; remainingT
   return { dateLabel: null, remainingText: s };
 }
 
+/**
+ * Checks whether a second merchant line in an Octopus App screenshot is a valid 2nd-line wrap
+ * of the preceding merchant line (e.g. "(Group) Limited", "Limited", "Co., Ltd."),
+ * rather than an unattached header or a separate row's merchant name.
+ */
+function isMerchantContinuationLine(prevLine: string, nextLine: string): boolean {
+  const prev = prevLine.trim();
+  const next = nextLine.trim();
+  if (!prev || !next) return false;
+  if (/^(?:\([^)]+\)|.*?\b(?:limited|ltd\.?|co\.?,?\s*ltd\.?|company|corporation|corp\.?|inc\.?|group|holdings?)\b)$/i.test(next)) {
+    return true;
+  }
+  if (/[(&\-/]$|\b(?:of|and|for|in|at|the)$/i.test(prev)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Parses Octopus App transaction history screenshots ("< Octopus 1 192116091(2)").
+ * Enforces strict verification that each transaction has:
+ *   1. One transaction name (merchant, e.g. "Wellcome", "Lung Fung Pharmaceutical (Group) Limited")
+ *   2. One timestamp ("YYYY-MM-DD HH:mm", e.g. "2026-09-08 15:53")
+ *   3. One signed decimal amount (e.g. "-65.0" or "+600.0")
+ * Automatically strips "< Octopus 1 192116091(2)" (and any Octopus header/card number) so header text
+ * never pollutes merchant names or transaction identification.
+ */
 export function parseOctopusAppHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
 
+  // Must contain at least one YYYY-MM-DD HH:mm timestamp AND signed decimal amounts (without HKD suffix)
   const hasIsoMinuteTimestamps = /\b20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\s+\d{1,2}:\d{2}\b/.test(
     text,
   );
   const hasSignedDecimals = /(?:^|\s)[-–—+]\s*[0-9,]+\.[0-9]{1,2}(?:\s|$)/m.test(text);
   if (!hasIsoMinuteTimestamps || !hasSignedDecimals) return [];
-  if (/-[0-9,]+\.[0-9]{2}\s*HKD\b/i.test(text)) return [];
+  if (/-[0-9,]+\.[0-9]{2}\s*HKD\b/i.test(text)) return []; // Hang Seng format
 
-  const rawLines = text
+  // Pre-split any single line that contains multiple complete (timestamp + amount) pairs
+  const expandedText = text.replace(
+    /(\b20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\s+\d{1,2}:\d{2}\s+[-–—+]\s*[0-9,]+\.[0-9]{1,2})\s+(?=[A-Za-z\u4e00-\u9fa5])/g,
+    "$1\n",
+  );
+
+  const rawLines = expandedText
     .split(/\r?\n/)
     .map((l) =>
       l
         .replace(/[⌃^へ⬆️↑]?\s*view latest/gi, " ")
+        .replace(
+          /(?:^|\s)[<‹＜«←⬅️⌃^]*\s*(?:octopus|八達通)(?:\s+\d+)?\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/gi,
+          " ",
+        )
+        .replace(
+          /^[<‹＜«←⬅️]+\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/i,
+          "",
+        )
+        .replace(/(?:^|\s)[<‹＜«←⬅️]*\s*\b\d{7,12}\s*[\(\[\{]\d+[\)\]\}]?(?:\s*(?:\(i\)|ⓘ|\+|⊕))?\s*/g, " ")
         .replace(/\s+/g, " ")
         .trim(),
     )
     .filter((l) => l.length > 0);
 
   const headerNoise =
-    /^(?:\d{1,2}:\d{2}|\d{1,3}%?|x|×|i|\(i\)|\+|octopus(?:\s+\d+)?|\d{7,12}(?:\s*\(\d+\))?|done|back|cancel)$/i;
+    /^(?:[<‹＜«←⬅️]*\s*(?:octopus|八達通)(?:\s+\d+)?(?:\s+\d{6,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?)?|\d{7,12}(?:\s*[\(\[\{]\d+[\)\]\}]?)?|\d{1,2}:\d{2}|\d{1,3}%?|5g|4g|lte|wifi|wi-fi|x|×|i|\(i\)|ⓘ|\+|⊕|done|back|cancel|last \d+ months?|past \d+ days?|all transactions|transaction history)$/i;
 
   const items: ParsedNotification[] = [];
   let merchantParts: string[] = [];
@@ -395,31 +497,38 @@ export function parseOctopusAppHistoryList(text: string, refDate = new Date()): 
         .trim(),
     );
 
-    if (currentAmount.sign === "+" || (fullMerchant && isTopUpLine(fullMerchant))) {
-      merchantParts = [];
-      currentTimestamp = null;
-      currentAmount = null;
+    // Reset state after extracting
+    merchantParts = [];
+    const ts = currentTimestamp;
+    const amt = currentAmount;
+    currentTimestamp = null;
+    currentAmount = null;
+
+    // Skip top-ups (+600.0 or Octopus Cards Limited)
+    if (amt.sign === "+" || (fullMerchant && isTopUpLine(fullMerchant))) {
       return;
     }
 
-    const merchant =
-      fullMerchant ||
-      (currentAmount.amountMinor <= 2500 ? "MTR Corporation Limited" : "Octopus");
+    // Strict verification: each transaction must have 1 valid merchant name, 1 timestamp, and 1 amount.
+    // Skip any clipped edge fragment that lacks a valid transaction name.
+    if (!fullMerchant || headerNoise.test(fullMerchant) || isDateOrTimestampLabel(fullMerchant)) {
+      return;
+    }
 
-    const resolved = resolveRelativeDay(currentTimestamp, refDate, items.length);
+    const resolved = resolveRelativeDay(ts, refDate, items.length);
 
     let subcategoryHint: string | undefined = undefined;
-    if (/\bmtr\b|\bminibus(?:es)?\b|\bbus\b|\bferry\b|\btram\b/i.test(merchant)) {
+    if (/\bmtr\b|\bminibus(?:es)?\b|\bbus\b|\bferry\b|\btram\b/i.test(fullMerchant)) {
       subcategoryHint = "Public transport";
-    } else if (/\btaxi\b/i.test(merchant)) {
+    } else if (/\btaxi\b/i.test(fullMerchant)) {
       subcategoryHint = "Taxi/Uber";
     }
 
     items.push({
-      amountMinor: currentAmount.amountMinor,
+      amountMinor: amt.amountMinor,
       currency: "HKD",
-      merchant,
-      merchantNormalized: normalizeMerchant(merchant),
+      merchant: fullMerchant,
+      merchantNormalized: normalizeMerchant(fullMerchant),
       subcategoryHint,
       type: "expense",
       sourceName: "Octopus",
@@ -429,12 +538,8 @@ export function parseOctopusAppHistoryList(text: string, refDate = new Date()): 
       isPersonToPerson: false,
       isAuthoritativeSource: true,
       confidence: 0.99,
-      rawText: `${merchant} · ${currentTimestamp} · ${currentAmount.raw}`,
+      rawText: `${fullMerchant} · ${ts} · ${amt.raw}`,
     });
-
-    merchantParts = [];
-    currentTimestamp = null;
-    currentAmount = null;
   };
 
   for (const line of rawLines) {
@@ -442,6 +547,7 @@ export function parseOctopusAppHistoryList(text: string, refDate = new Date()): 
 
     let working = line;
 
+    // 1. Extract YYYY-MM-DD HH:mm timestamp if present on this line
     const tsMatch = working.match(
       /\b(20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\s+\d{1,2}:\d{2})\b/,
     );
@@ -450,20 +556,18 @@ export function parseOctopusAppHistoryList(text: string, refDate = new Date()): 
       working = working.replace(tsMatch[0], " ").trim();
     }
 
+    // 2. Extract signed decimal amount (e.g. "-65.0", "-142.5", "-242.0", "+600.0")
     let extractedAmt: { sign: "+" | "-"; amountMinor: number; raw: string } | null = null;
     const amtMatch = working.match(/(?:^|\s)([-–—+])\s*(?:HKD|HK\$|\$)?\s*([0-9,]+\.[0-9]{1,2})(?=\s|$)/);
-    const clippedSevenMatch = !amtMatch ? working.match(/(?:^|\s)([-–—])[/\\]?\s*\.4(?=\s|$)/) : null;
 
     if (amtMatch) {
       const sign: "+" | "-" = amtMatch[1] === "+" ? "+" : "-";
       const amountMinor = Math.round(parseFloat(amtMatch[2].replace(/,/g, "")) * 100);
       extractedAmt = { sign, amountMinor, raw: `${sign}${amtMatch[2]}` };
       working = working.replace(amtMatch[0], " ").trim();
-    } else if (clippedSevenMatch) {
-      extractedAmt = { sign: "-", amountMinor: 740, raw: "-7.4" };
-      working = working.replace(clippedSevenMatch[0], " ").trim();
     }
 
+    // 3. Remaining text on this line is merchant name (or part of a 2-line merchant name)
     const remainingMerchant = cleanOcrMerchantName(
       working
         .replace(/\s+/g, " ")
@@ -471,13 +575,23 @@ export function parseOctopusAppHistoryList(text: string, refDate = new Date()): 
         .trim(),
     );
 
-    if (remainingMerchant && !headerNoise.test(remainingMerchant)) {
+    if (remainingMerchant && !headerNoise.test(remainingMerchant) && !isDateOrTimestampLabel(remainingMerchant)) {
       if (currentTimestamp) {
-        merchantParts = [];
+        // A new merchant line after an un-flushed timestamp means a new row has started
+        merchantParts = [remainingMerchant];
         currentTimestamp = null;
         currentAmount = null;
+      } else if (merchantParts.length === 0) {
+        merchantParts = [remainingMerchant];
+      } else if (
+        merchantParts.length === 1 &&
+        isMerchantContinuationLine(merchantParts[0], remainingMerchant)
+      ) {
+        merchantParts.push(remainingMerchant);
+      } else {
+        // Replace any orphaned earlier line so each transaction has strictly 1 merchant name
+        merchantParts = [remainingMerchant];
       }
-      merchantParts.push(remainingMerchant);
     }
 
     if (extractedTs) {
@@ -496,6 +610,12 @@ export function parseOctopusAppHistoryList(text: string, refDate = new Date()): 
   return items;
 }
 
+/**
+ * Parses one or more PayMe by HSBC email notifications from the Gmail App or Apple Mail:
+ * - Gmail push notification banner ("PayMe by HSBC now / You paid Claudia Yue / Transaction Transaction You paid Claudia Yue - HKD 2 Payment 23:50 10/10/2026...")
+ * - Gmail App inbox / search results list showing multiple PayMe email snippets on one screen
+ * - Opened PayMe email body inside the Gmail App or Apple Mail
+ */
 export function parsePayMeEmailNotifications(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
   const flat = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
@@ -507,12 +627,10 @@ export function parsePayMeEmailNotifications(text: string, refDate = new Date())
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(flat)) !== null) {
-    const rawMerchant = cleanOcrMerchantName(
-      match[1]
-        .replace(/^(?:Transaction\s+)+/i, "")
-        .replace(/^(?:You(?:'ve)? paid\s+)+/i, "")
-        .trim(),
-    );
+    const rawMerchant = match[1]
+      .replace(/^(?:Transaction\s+)+/i, "")
+      .replace(/^(?:You(?:'ve)? paid\s+)+/i, "")
+      .trim();
     if (!rawMerchant || isTopUpLine(rawMerchant) || isDateOrTimestampLabel(rawMerchant)) continue;
 
     const amountMinor = Math.round(parseFloat(match[2].replace(/,/g, "")) * 100);
@@ -560,6 +678,10 @@ export function parsePayMeEmailNotification(text: string, refDate = new Date()):
   return list[0] ?? null;
 }
 
+/**
+ * Parses Hang Seng Bank App transaction history screenshots (e.g. "02cfbc71.jpeg").
+ * Automatically skips PayMe top-ups ("LAM JANIS SZE YUET HKDD5326818092") and Octopus top-ups ("APPLEPAY OCTOPUS CAR").
+ */
 export function parseHangSengHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
   if (
@@ -614,7 +736,7 @@ export function parseHangSengHistoryList(text: string, refDate = new Date()): Pa
             .replace(/^(?:CUP|VISA|MASTER)\s+/i, "")
             .trim(),
         );
-        const merchant = cleanOcrMerchantName(descSplit.remainingText) || "Hang Seng Purchase";
+        const merchant = descSplit.remainingText || "Hang Seng Purchase";
         const effectiveDateLabel = descSplit.dateLabel ?? currentHeaderDateLabel;
         const resolved = resolveRelativeDay(effectiveDateLabel, refDate, items.length);
 
@@ -653,7 +775,7 @@ export function parseHangSengHistoryList(text: string, refDate = new Date()): Pa
           .replace(/^(?:CUP|VISA|MASTER)\s+/i, "")
           .trim(),
       );
-      const merchant = cleanOcrMerchantName(descSplit.remainingText) || "Hang Seng Purchase";
+      const merchant = descSplit.remainingText || "Hang Seng Purchase";
       const effectiveDateLabel = descSplit.dateLabel ?? currentHeaderDateLabel;
       const resolved = resolveRelativeDay(effectiveDateLabel, refDate, items.length);
 
@@ -687,7 +809,7 @@ export function parseHangSengHistoryList(text: string, refDate = new Date()): Pa
         const descSplit = splitDateFromText(
           embeddedHkd[1].replace(/^(?:CUP|VISA|MASTER)\s+/i, "").trim(),
         );
-        const merchant = cleanOcrMerchantName(descSplit.remainingText) || "Hang Seng Purchase";
+        const merchant = descSplit.remainingText || "Hang Seng Purchase";
         const effectiveDateLabel = descSplit.dateLabel ?? currentHeaderDateLabel;
         const resolved = resolveRelativeDay(effectiveDateLabel, refDate, items.length);
 
@@ -713,6 +835,9 @@ export function parseHangSengHistoryList(text: string, refDate = new Date()): Pa
   return items;
 }
 
+/**
+ * Parses PayMe App transaction history screenshots (e.g. "c1de4956.jpeg" and "cd8e9659.jpeg").
+ */
 export function parsePayMeAppHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
   const hasSignedAmounts = /(?:^|\s)[+-]\s*[0-9,]+\.[0-9]{2}(?:\s|$)/m.test(text);
@@ -756,7 +881,7 @@ export function parsePayMeAppHistoryList(text: string, refDate = new Date()): Pa
 
     const sameLine = line.match(/^(.+?)\s+([+-])\s*([0-9,]+\.[0-9]{2})$/);
     if (sameLine) {
-      const name = cleanOcrMerchantName(sameLine[1].trim());
+      const name = sameLine[1].trim();
       const sign = sameLine[2];
       const amtStr = sameLine[3];
 
@@ -820,10 +945,10 @@ export function parsePayMeAppHistoryList(text: string, refDate = new Date()): Pa
         !/[+-]\s*[0-9,]+\.[0-9]{2}/.test(prev2) &&
         !isDateOrTimestampLabel(prev1)
       ) {
-        name = cleanOcrMerchantName(prev2);
+        name = prev2;
         note = prev1;
       } else if (prev1 && !isDateOrTimestampLabel(prev1) && !navNoise.test(prev1)) {
-        name = cleanOcrMerchantName(prev1);
+        name = prev1;
         if (
           i + 1 < rawLines.length &&
           !isDateOrTimestampLabel(rawLines[i + 1]) &&
@@ -870,6 +995,9 @@ export function parsePayMeAppHistoryList(text: string, refDate = new Date()): Pa
   return items;
 }
 
+/**
+ * Parses an individual single-line notification string into structured transaction data.
+ */
 export function parseNotification(text: string, refDate = new Date()): ParsedNotification | null {
   if (!text || typeof text !== "string") return null;
   const t = text.trim();
@@ -882,26 +1010,33 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     return null;
   }
 
+  // Single-line Octopus App row (e.g. "Wellcome 2026-09-08 15:53 -65.0")
+  const octopusAppSingle = parseOctopusAppHistoryList(t, refDate);
+  if (octopusAppSingle.length === 1) {
+    return octopusAppSingle[0];
+  }
+
   const paymeEmail = parsePayMeEmailNotification(t, refDate);
   if (paymeEmail) return paymeEmail;
 
   let m: RegExpMatchArray | null;
 
+  // 1. Apple Wallet Lock Screen Octopus format
   if (
     (m = t.match(
       /^(?:Octopus[:\s]*)?(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s+(?:for\s+([A-Za-z0-9 &/-]+)|(Purchase|零售|消費|付款))(?:\.|$)/i,
     ))
   ) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
-    const forTarget = cleanOcrMerchantName(m[2]?.trim() ?? "");
+    const forTarget = m[2]?.trim();
     const isGenericPurchase = !!m[3];
-    const merchant = forTarget || (isGenericPurchase ? "Octopus Purchase" : "Octopus");
+    const merchant = cleanOcrMerchantName(forTarget || (isGenericPurchase ? "Octopus Purchase" : "Octopus")) || "Octopus";
     return {
       amountMinor,
       currency: "HKD",
       merchant,
       merchantNormalized: normalizeMerchant(merchant),
-      subcategoryHint: forTarget || undefined,
+      subcategoryHint: forTarget,
       type: "expense",
       sourceName: "Octopus",
       sourceKind: "octopus",
@@ -913,8 +1048,9 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 2. Octopus Chinese Spend
   if ((m = t.match(/八達通[:：]?\s*於\s*([^。，\n]+?)\s*扣除\s*HK\$?([0-9,]+(?:\.[0-9]{1,2})?)/i))) {
-    const merchant = cleanOcrMerchantName(m[1].trim());
+    const merchant = cleanOcrMerchantName(m[1].trim()) || m[1].trim();
     const amountMinor = Math.round(parseFloat(m[2].replace(/,/g, "")) * 100);
     const balMatch = t.match(/餘額\s*HK\$?([0-9,]+(?:\.[0-9]{1,2})?)/i);
     return {
@@ -934,9 +1070,10 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 3. Octopus English Spend
   if ((m = t.match(/Octopus:?\s*(?:Paid|Payment of|Spent|-)?\s*HK\$?([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|for)\s*([^.·\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
-    const merchant = cleanOcrMerchantName(m[2].trim());
+    const merchant = cleanOcrMerchantName(m[2].trim()) || m[2].trim();
     const balMatch = t.match(/(?:Remaining|Balance|new balance is)\s*(?:balance\s*)?HK\$?([0-9,]+(?:\.[0-9]{1,2})?)/i);
     return {
       amountMinor,
@@ -955,9 +1092,10 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 4a. Apple Pay / Wallet with card AND merchant
   if ((m = t.match(/(?:You paid|Paid|Spent|Payment of)\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|for)\s*([^.·\n]+?)\s+with\s+([^.]+?)(?:\.|$)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
-    const merchant = cleanOcrMerchantName(m[2].trim());
+    const merchant = cleanOcrMerchantName(m[2].trim()) || m[2].trim();
     const card = m[3].trim();
     const isOct = card.toLowerCase().includes("octopus") || card.includes("八達通");
     return {
@@ -976,6 +1114,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 4b. Apple Pay / Wallet without merchant
   if ((m = t.match(/(?:You paid|Paid|Spent|Payment of)?\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at\s+)?with\s+([^.·\n]+?)(?:\.|$)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const card = m[2].trim();
@@ -997,12 +1136,13 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 5. PayMe Notifications
   if (
     (m = t.match(
       /(?:You(?:'ve)? paid|paid|已付款|轉賬給|付款給)\s+([^0-9$]+?)\s*[-–—]?\s*(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i,
     ))
   ) {
-    const target = cleanOcrMerchantName(m[1].replace(/^(?:to|於|給|at)\s+/i, "").trim());
+    const target = m[1].replace(/^(?:to|於|給|at)\s+/i, "").trim();
     if (isDateOrTimestampLabel(target)) return null;
     const amountMinor = Math.round(parseFloat(m[2].replace(/,/g, "")) * 100);
     const isP2P = !/Starbucks|Pacific Coffee|7-Eleven|Circle K|HKTVmall|store|shop|patisserie|café|cafe|bakery/i.test(target);
@@ -1025,7 +1165,7 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
 
   if ((m = t.match(/(?:You(?:'ve)? paid|已付款)\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:to|at|給|於)\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
-    const target = cleanOcrMerchantName(m[2].trim());
+    const target = m[2].trim();
     const isP2P = !/Starbucks|Pacific Coffee|7-Eleven|Circle K|HKTVmall|store|shop|patisserie|café|cafe|bakery/i.test(target);
     return {
       amountMinor,
@@ -1044,12 +1184,13 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 6. Bank & Credit Card Notifications / Gmail e-Alerts (HSBC, Hang Seng, Standard Chartered, Mox, ZA, Citi, BOC, DBS)
   if ((m = t.match(/(?:HSBC|Hang Seng|Standard Chartered|Mox|ZA Bank|Citi|BOC|DBS|Credit Card|信用卡)[^:]*:?[^0-9]*(?:spent|purchase of|made at|payment of|transaction of|扣除|簽賬|付款)?\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:was made at|at|to|with Card ending \d+ at|於)\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const rawMerch = m[2].trim();
     const split = splitDateFromText(rawMerch.replace(/\s+(?:on|with)\s+/i, " "));
     const merchant = cleanOcrMerchantName(split.remainingText || rawMerch.replace(/\s+(?:on|with).*$/, "").trim());
-    if (isTopUpLine(merchant)) return null;
+    if (!merchant || isTopUpLine(merchant)) return null;
     const resolved = split.dateLabel ? resolveRelativeDay(split.dateLabel, refDate, 0) : { date: refDate, precision: "minute" as DatePrecision };
     return {
       amountMinor,
@@ -1067,12 +1208,13 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 7. Amount with destination: "HK$8.70 at KMB" / "HKD 614.00 at KPAY*KITSUNE"
   if ((m = t.match(/(?:HKD|HK\$|\$)\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|for|於|給)\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const rawMerch = m[2].trim();
     const split = splitDateFromText(rawMerch.replace(/\s+(?:on|with)\s+/i, " "));
     const merchant = cleanOcrMerchantName(split.remainingText || rawMerch.replace(/\s+(?:on|with).*$/, "").trim());
-    if (isTopUpLine(merchant)) return null;
+    if (!merchant || isTopUpLine(merchant)) return null;
     const isOctopusTransit = /^(?:bus|train|mtr|transit|minibus|ferry|tram|light rail)$/i.test(merchant);
     const resolved = split.dateLabel ? resolveRelativeDay(split.dateLabel, refDate, 0) : { date: refDate, precision: "minute" as DatePrecision };
     return {
@@ -1092,10 +1234,11 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
     };
   }
 
+  // 8. General Smart Fallback Pattern
   if ((m = t.match(/(?:spent|paid|payment of|簽賬|付款)\s*(?:HKD|HK\$|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:at|to|於)?\s*([^.。，\n]+)/i))) {
     const amountMinor = Math.round(parseFloat(m[1].replace(/,/g, "")) * 100);
     const merchant = cleanOcrMerchantName(m[2].replace(/\s+(?:on|with).*$/, "").trim());
-    if (isDateOrTimestampLabel(merchant) || isTopUpLine(merchant)) return null;
+    if (!merchant || isDateOrTimestampLabel(merchant) || isTopUpLine(merchant)) return null;
     return {
       amountMinor,
       currency: "HKD",
@@ -1115,11 +1258,14 @@ export function parseNotification(text: string, refDate = new Date()): ParsedNot
   return null;
 }
 
+/**
+ * Parses an Apple Wallet Lock Screen notification stack or "Latest Transactions" history screenshot.
+ */
 export function parseWalletHistoryList(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
   const rawLines = text
     .split(/\r?\n/)
-    .map((l) => l.replace(/[>›»]/g, "").trim())
+    .map((l) => cleanOcrMerchantName(l.replace(/[>›»]/g, "").trim()))
     .filter((l) => l.length > 0);
 
   const noise =
@@ -1202,14 +1348,14 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
     const prefixSplit = splitDateFromText(rawPrefix);
     const suffixSplit = splitDateFromText(rawSuffix);
 
-    let title = cleanOcrMerchantName(prefixSplit.remainingText);
+    let title = prefixSplit.remainingText;
     let subtitle: string | null = null;
     let dayLabel: string | null = prefixSplit.dateLabel ?? suffixSplit.dateLabel ?? pendingTimestampLabel;
 
     if (!title && suffixSplit.remainingText) {
       const forMatch = suffixSplit.remainingText.match(/^(?:for\s+)?([A-Za-z0-9 &/-]+)$/i);
       if (forMatch) {
-        const cleanSuffix = cleanOcrMerchantName(forMatch[1].trim());
+        const cleanSuffix = forMatch[1].trim();
         if (/^purchase$/i.test(cleanSuffix)) {
           title = "Octopus Purchase";
         } else {
@@ -1228,7 +1374,7 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       if (prevSplit.dateLabel && !dayLabel) {
         dayLabel = prevSplit.dateLabel;
       }
-      const cleanPrev = cleanOcrMerchantName(prevSplit.remainingText);
+      const cleanPrev = prevSplit.remainingText;
       if (!cleanPrev) continue;
 
       if (transportSubRegex.test(cleanPrev) && !subtitle) {
@@ -1247,7 +1393,7 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       if (nextSplit.dateLabel && !dayLabel) {
         dayLabel = nextSplit.dateLabel;
       }
-      const cleanNext = cleanOcrMerchantName(nextSplit.remainingText);
+      const cleanNext = nextSplit.remainingText;
       if (!cleanNext) continue;
 
       if (transportSubRegex.test(cleanNext) && !subtitle) {
@@ -1262,13 +1408,13 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
       continue;
     }
 
-    let merchant = cleanOcrMerchantName(title || subtitle || "Octopus Purchase");
+    let merchant = cleanOcrMerchantName(title || subtitle || "Octopus Purchase") || "Octopus Purchase";
     let location: string | undefined = undefined;
     let subcategoryHint: string | undefined = undefined;
 
     if (subtitle && title && title.toLowerCase() !== subtitle.toLowerCase()) {
-      merchant = cleanOcrMerchantName(subtitle);
-      location = title;
+      merchant = cleanOcrMerchantName(subtitle) || subtitle;
+      location = cleanOcrMerchantName(title) || title;
       subcategoryHint = subtitle;
     } else if (transportSubRegex.test(merchant)) {
       subcategoryHint = merchant;
@@ -1298,34 +1444,48 @@ export function parseWalletHistoryList(text: string, refDate = new Date()): Pars
   return items;
 }
 
+/**
+ * Master multi-line parser for:
+ *  - Octopus App history screenshots ("Octopus 1 / 192116091(2)", "2026-09-27 16:53 -142.5") — Authoritative Source of Truth
+ *  - Gmail App popup banners, Gmail inbox list screenshots, and opened PayMe emails
+ *  - Hang Seng Bank App history screenshots ("CUP KPAY*KITSUNE 14OCT HKD 614.00 -614.00 HKD")
+ *  - PayMe App history screenshots ("Claudia Yue - 800.00 / $70/hr")
+ *  - Apple Wallet / Octopus Lock Screen & history screenshots
+ */
 export function parseMultipleNotifications(text: string, refDate = new Date()): ParsedNotification[] {
   if (!text) return [];
 
+  // 1. Check Octopus App transaction history screenshot first (Authoritative Source of Truth for Octopus)
   const octopusAppItems = parseOctopusAppHistoryList(text, refDate);
   if (octopusAppItems.length > 0) {
     return octopusAppItems;
   }
 
+  // 2. Check PayMe email / Gmail App banners, inbox list, or opened emails
   const paymeEmails = parsePayMeEmailNotifications(text, refDate);
   if (paymeEmails.length > 0) {
     return paymeEmails;
   }
 
+  // 3. Check Hang Seng Bank App history screenshot
   const hangSengItems = parseHangSengHistoryList(text, refDate);
   if (hangSengItems.length > 0) {
     return hangSengItems;
   }
 
+  // 4. Check PayMe App history screenshot
   const paymeAppItems = parsePayMeAppHistoryList(text, refDate);
   if (paymeAppItems.length > 0) {
     return paymeAppItems;
   }
 
+  // 5. Check Apple Wallet / Lock Screen Octopus history list
   const historyItems = parseWalletHistoryList(text, refDate);
   if (historyItems.length > 0) {
     return historyItems;
   }
 
+  // 6. Fallback to line-by-line single notification parsing
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())
