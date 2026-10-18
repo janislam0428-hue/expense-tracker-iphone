@@ -8,6 +8,7 @@ import { checkPassword, createSession, requireAuth } from "@/lib/auth/session";
 import { hashPassword } from "@/lib/auth/password";
 import { loadDemoData, removeDemoData } from "@/lib/demo/apply";
 import { toMinor } from "@/lib/money";
+import { formatInZone, monthPeriod } from "@/lib/time";
 import { CURRENCIES } from "./options";
 
 export type FormState = { ok?: string; error?: string } | undefined;
@@ -31,7 +32,20 @@ const generalSchema = z.object({
   weekStart: z.enum(["0", "1"]).transform(Number),
   reviewThreshold: amount,
   alertThreshold: amount,
+  thresholdComment: z.string().optional(),
 });
+
+function resolveThresholdComment(
+  rawComment: string | undefined | null,
+  fallbackComment: string | undefined | null,
+  source: "suggestion" | "manual",
+): string {
+  const c1 = rawComment?.trim();
+  if (c1) return c1;
+  const c2 = fallbackComment?.trim();
+  if (c2) return c2;
+  return source === "suggestion" ? "according to suggestion" : "threshold testing and adjustment";
+}
 
 export async function saveSettings(_prev: FormState, formData: FormData): Promise<FormState> {
   await requireAuth();
@@ -39,21 +53,47 @@ export async function saveSettings(_prev: FormState, formData: FormData): Promis
   if (!parsed.success) return { error: parsed.error.issues[0]?.message ?? "Check the values and try again" };
   const d = parsed.data;
 
+  const existingSettings = await db.settings.findUnique({ where: { id: 1 } });
+  const existingCategories = await db.category.findMany({ where: { parentId: null, archived: false } });
+  const existingCatMap = new Map(existingCategories.map((c) => [c.id, c]));
+
+  const now = new Date();
+  const currentMonthStart = monthPeriod(now, d.timezone).start;
+  const currentMonthKey = formatInZone(currentMonthStart, "yyyy-MM", d.timezone);
+
   // Per category alert overrides arrive as cat_<id>. Blank means "use the default".
-  const overrides: Array<{ id: string; value: number | null }> = [];
+  const overrides: Array<{
+    id: string;
+    value: number | null;
+    comment: string;
+    source: "suggestion" | "manual";
+  }> = [];
+
   for (const [key, raw] of formData.entries()) {
     if (!key.startsWith("cat_")) continue;
+    const catId = key.slice(4);
     const v = String(raw).trim();
-    if (v === "") overrides.push({ id: key.slice(4), value: null });
-    else {
+    const rawCatComment = String(formData.get(`comment_${catId}`) ?? "").trim();
+    const rawCatSource = String(formData.get(`source_${catId}`) ?? "").trim();
+    const source: "suggestion" | "manual" =
+      rawCatSource === "suggestion" || rawCatComment.toLowerCase() === "according to suggestion"
+        ? "suggestion"
+        : "manual";
+    const comment = resolveThresholdComment(rawCatComment, d.thresholdComment, source);
+
+    if (v === "") {
+      overrides.push({ id: catId, value: null, comment, source });
+    } else {
       const p = amount.safeParse(v);
       if (!p.success) return { error: "Category alert amounts must be plain numbers, or blank for the default" };
-      overrides.push({ id: key.slice(4), value: p.data });
+      overrides.push({ id: catId, value: p.data, comment, source });
     }
   }
 
-  await db.$transaction([
-    db.settings.update({
+  let changedCount = 0;
+
+  await db.$transaction(async (tx) => {
+    await tx.settings.update({
       where: { id: 1 },
       data: {
         currency: d.currency,
@@ -62,25 +102,147 @@ export async function saveSettings(_prev: FormState, formData: FormData): Promis
         reviewThresholdMinor: d.reviewThreshold,
         alertThresholdMinor: d.alertThreshold,
       },
-    }),
-    ...overrides.map((o) => db.category.update({ where: { id: o.id }, data: { monthlyAlertMinor: o.value } })),
-  ]);
+    });
+
+    // Log global default threshold change if modified
+    const prevGlobalAlert = existingSettings?.alertThresholdMinor ?? 200000;
+    if (prevGlobalAlert !== d.alertThreshold) {
+      changedCount++;
+      const globalComment = resolveThresholdComment(d.thresholdComment, null, "manual");
+      await tx.alertRule.create({
+        data: {
+          scope: "threshold_log",
+          categoryId: null,
+          strategy: currentMonthKey,
+          enabled: false,
+          params: JSON.stringify({
+            monthKey: currentMonthKey,
+            categoryId: null,
+            categoryName: "Default Monthly Alert",
+            previousMinor: prevGlobalAlert,
+            amountMinor: d.alertThreshold,
+            comment: globalComment,
+            source: "manual",
+            changedAt: now.toISOString(),
+          }),
+        },
+      });
+    }
+
+    for (const o of overrides) {
+      const prevCat = existingCatMap.get(o.id);
+      if (!prevCat) continue;
+
+      const prevEffective = prevCat.monthlyAlertMinor ?? prevGlobalAlert;
+      const nextEffective = o.value ?? d.alertThreshold;
+      const explicitCatComment = String(formData.get(`comment_${o.id}`) ?? "").trim();
+      const didChange = prevCat.monthlyAlertMinor !== o.value || prevEffective !== nextEffective;
+
+      await tx.category.update({
+        where: { id: o.id },
+        data: { monthlyAlertMinor: o.value },
+      });
+
+      // Always keep the current month's Budget snapshot aligned with the latest threshold in this month
+      await tx.budget.upsert({
+        where: { categoryId_period: { categoryId: o.id, period: currentMonthKey } },
+        create: { categoryId: o.id, period: currentMonthKey, amountMinor: nextEffective },
+        update: { amountMinor: nextEffective },
+      });
+
+      if (didChange || explicitCatComment.length > 0) {
+        changedCount++;
+        await tx.alertRule.create({
+          data: {
+            scope: "threshold_log",
+            categoryId: o.id,
+            strategy: currentMonthKey,
+            enabled: false,
+            params: JSON.stringify({
+              monthKey: currentMonthKey,
+              categoryId: o.id,
+              categoryName: prevCat.name,
+              previousMinor: prevEffective,
+              amountMinor: nextEffective,
+              comment: o.comment,
+              source: o.source,
+              changedAt: now.toISOString(),
+            }),
+          },
+        });
+      }
+    }
+  });
+
   revalidatePath("/", "layout");
-  return { ok: "Settings saved" };
+  return {
+    ok:
+      changedCount > 0
+        ? `Settings saved & documented ${changedCount} threshold update${changedCount === 1 ? "" : "s"} for ${currentMonthKey}`
+        : "Settings saved",
+  };
 }
 
 export async function updateCategoryThresholdQuick(
   categoryId: string,
   amountMinor: number,
+  options?: { comment?: string; source?: "suggestion" | "manual"; monthKey?: string },
 ): Promise<{ ok?: string; error?: string }> {
   await requireAuth();
   try {
-    const cat = await db.category.update({
-      where: { id: categoryId },
-      data: { monthlyAlertMinor: amountMinor },
+    const settings = await db.settings.findUnique({ where: { id: 1 } });
+    const zone = settings?.timezone ?? "Asia/Hong_Kong";
+    const now = new Date();
+    const currentMonthKey =
+      options?.monthKey && /^\d{4}-\d{2}$/.test(options.monthKey)
+        ? options.monthKey
+        : formatInZone(monthPeriod(now, zone).start, "yyyy-MM", zone);
+
+    const existingCat = await db.category.findUnique({ where: { id: categoryId } });
+    if (!existingCat) return { error: "Category not found" };
+
+    const prevEffective = existingCat.monthlyAlertMinor ?? settings?.alertThresholdMinor ?? 200000;
+    const source: "suggestion" | "manual" = options?.source ?? "suggestion";
+    const comment = resolveThresholdComment(options?.comment, null, source);
+
+    const cat = await db.$transaction(async (tx) => {
+      const updated = await tx.category.update({
+        where: { id: categoryId },
+        data: { monthlyAlertMinor: amountMinor },
+      });
+
+      await tx.budget.upsert({
+        where: { categoryId_period: { categoryId, period: currentMonthKey } },
+        create: { categoryId, period: currentMonthKey, amountMinor },
+        update: { amountMinor },
+      });
+
+      await tx.alertRule.create({
+        data: {
+          scope: "threshold_log",
+          categoryId,
+          strategy: currentMonthKey,
+          enabled: false,
+          params: JSON.stringify({
+            monthKey: currentMonthKey,
+            categoryId,
+            categoryName: updated.name,
+            previousMinor: prevEffective,
+            amountMinor,
+            comment,
+            source,
+            changedAt: now.toISOString(),
+          }),
+        },
+      });
+
+      return updated;
     });
+
     revalidatePath("/", "layout");
-    return { ok: `Updated ${cat.name} monthly threshold to $${Math.round(amountMinor / 100)}` };
+    return {
+      ok: `Updated ${cat.name} threshold to $${Math.round(amountMinor / 100)} (${currentMonthKey} · "${comment}")`,
+    };
   } catch {
     return { error: "Could not update category threshold" };
   }

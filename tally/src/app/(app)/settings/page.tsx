@@ -47,8 +47,11 @@ export default async function SettingsPage() {
               currentMonth: plain(pacing?.spentMinor ?? 0),
               lastMonth: plain(pacing?.lastMonthMinor ?? 0),
               suggested: plain(pacing?.suggestedThresholdMinor ?? settings.alertThresholdMinor),
+              latestComment: pacing?.thresholdComment ?? "threshold testing and adjustment",
+              latestUpdatedAt: pacing?.thresholdUpdatedAt ?? null,
             };
           })}
+        thresholdLogs={overview.thresholdLogs}
       />
 
       <section id="webhook" aria-labelledby="webhook-h" className="flex scroll-mt-8 flex-col gap-5">
